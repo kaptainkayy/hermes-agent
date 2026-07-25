@@ -318,6 +318,7 @@ async def test_ephemeral_plugin_command_edits_interaction_without_channel_dispat
                 "args_hint": "<question>",
                 "plugin": "second-brain",
                 "response_visibility": "ephemeral",
+                "dispatch": "direct",
             }
         },
     ):
@@ -326,6 +327,42 @@ async def test_ephemeral_plugin_command_edits_interaction_without_channel_dispat
     interaction.response.defer.assert_awaited_once_with(ephemeral=True)
     interaction.edit_original_response.assert_awaited_once_with(
         content="private answer: what do I know?"
+    )
+    interaction.delete_original_response.assert_not_awaited()
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_direct_plugin_command_edits_interaction_without_visibility_metadata(adapter):
+    """Direct plugin commands use direct dispatch metadata, not visibility metadata."""
+    adapter.handle_message = AsyncMock()
+    interaction = SimpleNamespace(
+        user=SimpleNamespace(name="Jezza", id=42, display_name="Jezza"),
+        channel=SimpleNamespace(id=123),
+        channel_id=123,
+        guild_id=999,
+        response=SimpleNamespace(defer=AsyncMock()),
+        edit_original_response=AsyncMock(),
+        delete_original_response=AsyncMock(),
+    )
+
+    with patch(
+        "hermes_cli.plugins.get_plugin_commands",
+        return_value={
+            "second-brain": {
+                "handler": lambda args: f"direct answer: {args}",
+                "description": "Search second brain",
+                "args_hint": "<question>",
+                "plugin": "second-brain",
+                "dispatch": "direct",
+            }
+        },
+    ):
+        await adapter._run_simple_slash(interaction, "/second-brain what do I know?")
+
+    interaction.response.defer.assert_awaited_once_with(ephemeral=True)
+    interaction.edit_original_response.assert_awaited_once_with(
+        content="direct answer: what do I know?"
     )
     interaction.delete_original_response.assert_not_awaited()
     adapter.handle_message.assert_not_awaited()
@@ -357,6 +394,7 @@ async def test_ephemeral_plugin_command_failure_edits_friendly_without_dispatch(
                 "args_hint": "<question>",
                 "plugin": "second-brain",
                 "response_visibility": "ephemeral",
+                "dispatch": "direct",
             }
         },
     ), caplog.at_level("WARNING"):

@@ -2922,7 +2922,7 @@ class DiscordAdapter(BasePlatformAdapter):
             from hermes_cli.plugins import get_plugin_commands
 
             plugin_command = get_plugin_commands().get(command_name.replace("_", "-"))
-            if plugin_command and plugin_command.get("response_visibility") == "ephemeral":
+            if plugin_command and plugin_command.get("dispatch") == "direct":
                 result = plugin_command["handler"](raw_args.strip())
                 if asyncio.iscoroutine(result):
                     result = await result

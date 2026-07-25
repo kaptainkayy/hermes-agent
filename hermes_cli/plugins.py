@@ -415,6 +415,7 @@ class PluginContext:
         handler: Callable,
         description: str = "",
         args_hint: str = "",
+        response_visibility: str = "public",
     ) -> None:
         """Register a slash command (e.g. ``/lcm``) available in CLI and gateway sessions.
 
@@ -460,6 +461,7 @@ class PluginContext:
             "description": description or "Plugin command",
             "plugin": self.manifest.name,
             "args_hint": (args_hint or "").strip(),
+            "response_visibility": response_visibility,
         }
         logger.debug("Plugin %s registered command: /%s", self.manifest.name, clean)
 

@@ -1049,6 +1049,22 @@ class TestPluginCommands:
         entry = mgr._plugin_commands["metricas"]
         assert entry["args_hint"] == "dias:7 formato:json"
 
+    def test_register_command_stores_response_visibility_metadata(self):
+        """response_visibility is stored, defaulting to public unless overridden."""
+        mgr = PluginManager()
+        manifest = PluginManifest(name="test-plugin", source="user")
+        ctx = PluginContext(manifest, mgr)
+
+        ctx.register_command("public-cmd", lambda a: a)
+        ctx.register_command(
+            "private-cmd",
+            lambda a: a,
+            response_visibility="ephemeral",
+        )
+
+        assert mgr._plugin_commands["public-cmd"]["response_visibility"] == "public"
+        assert mgr._plugin_commands["private-cmd"]["response_visibility"] == "ephemeral"
+
     def test_register_command_args_hint_whitespace_trimmed(self):
         """args_hint leading/trailing whitespace is stripped."""
         mgr = PluginManager()

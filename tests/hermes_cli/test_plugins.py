@@ -1065,6 +1065,18 @@ class TestPluginCommands:
         assert mgr._plugin_commands["public-cmd"]["response_visibility"] == "public"
         assert mgr._plugin_commands["private-cmd"]["response_visibility"] == "ephemeral"
 
+    def test_register_command_stores_dispatch_metadata(self):
+        """dispatch defaults to agent and can opt into direct handler dispatch."""
+        mgr = PluginManager()
+        manifest = PluginManifest(name="test-plugin", source="user")
+        ctx = PluginContext(manifest, mgr)
+
+        ctx.register_command("agent-cmd", lambda a: a)
+        ctx.register_command("direct-cmd", lambda a: a, dispatch="direct")
+
+        assert mgr._plugin_commands["agent-cmd"]["dispatch"] == "agent"
+        assert mgr._plugin_commands["direct-cmd"]["dispatch"] == "direct"
+
     def test_register_command_args_hint_whitespace_trimmed(self):
         """args_hint leading/trailing whitespace is stripped."""
         mgr = PluginManager()

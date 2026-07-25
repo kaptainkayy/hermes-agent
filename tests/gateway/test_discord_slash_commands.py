@@ -292,6 +292,45 @@ async def test_plugin_command_name_conflict_skipped(adapter):
     )
 
 
+@pytest.mark.asyncio
+async def test_ephemeral_plugin_command_edits_interaction_without_channel_dispatch(adapter):
+    """Ephemeral plugin commands answer privately without dispatching to the channel."""
+    adapter.handle_message = AsyncMock()
+    interaction = SimpleNamespace(
+        user=SimpleNamespace(name="Jezza", id=42, display_name="Jezza"),
+        channel=SimpleNamespace(id=123),
+        channel_id=123,
+        guild_id=999,
+        response=SimpleNamespace(defer=AsyncMock()),
+        edit_original_response=AsyncMock(),
+        delete_original_response=AsyncMock(),
+    )
+
+    async def handler(args):
+        return f"private answer: {args}"
+
+    with patch(
+        "hermes_cli.plugins.get_plugin_commands",
+        return_value={
+            "second-brain": {
+                "handler": handler,
+                "description": "Search second brain",
+                "args_hint": "<question>",
+                "plugin": "second-brain",
+                "response_visibility": "ephemeral",
+            }
+        },
+    ):
+        await adapter._run_simple_slash(interaction, "/second-brain what do I know?")
+
+    interaction.response.defer.assert_awaited_once_with(ephemeral=True)
+    interaction.edit_original_response.assert_awaited_once_with(
+        content="private answer: what do I know?"
+    )
+    interaction.delete_original_response.assert_not_awaited()
+    adapter.handle_message.assert_not_awaited()
+
+
 # ------------------------------------------------------------------
 # _handle_thread_create_slash — success, session dispatch, failure
 # ------------------------------------------------------------------
@@ -980,4 +1019,3 @@ def test_register_skill_command_autocomplete_filters_by_name_and_description(ada
     # (covered in other tests). The autocomplete filter itself is exercised
     # via direct function call in the real-discord integration path.
     assert skill_cmd.callback is not None
-

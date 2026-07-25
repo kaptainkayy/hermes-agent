@@ -2916,6 +2916,21 @@ class DiscordAdapter(BasePlatformAdapter):
             return
 
         await interaction.response.defer(ephemeral=True)
+
+        command_name, _, raw_args = command_text.lstrip("/").partition(" ")
+        try:
+            from hermes_cli.plugins import get_plugin_commands
+
+            plugin_command = get_plugin_commands().get(command_name.replace("_", "-"))
+            if plugin_command and plugin_command.get("response_visibility") == "ephemeral":
+                result = plugin_command["handler"](raw_args.strip())
+                if asyncio.iscoroutine(result):
+                    result = await result
+                await interaction.edit_original_response(content=str(result) if result else "")
+                return
+        except Exception as e:
+            logger.debug("Ephemeral plugin slash dispatch failed: %s", e)
+
         event = self._build_slash_event(interaction, command_text)
         await self.handle_message(event)
         try:

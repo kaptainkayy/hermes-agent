@@ -2929,7 +2929,17 @@ class DiscordAdapter(BasePlatformAdapter):
                 await interaction.edit_original_response(content=str(result) if result else "")
                 return
         except Exception as e:
-            logger.debug("Ephemeral plugin slash dispatch failed: %s", e)
+            logger.warning("Ephemeral plugin slash dispatch failed: %s", e)
+            try:
+                await interaction.edit_original_response(
+                    content="This command could not be completed. Please try again later."
+                )
+            except Exception as edit_error:
+                logger.warning(
+                    "Could not edit ephemeral plugin slash failure response: %s",
+                    edit_error,
+                )
+            return
 
         event = self._build_slash_event(interaction, command_text)
         await self.handle_message(event)

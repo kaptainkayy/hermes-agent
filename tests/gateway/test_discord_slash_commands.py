@@ -331,6 +331,46 @@ async def test_ephemeral_plugin_command_edits_interaction_without_channel_dispat
     adapter.handle_message.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_ephemeral_plugin_command_failure_edits_friendly_without_dispatch(adapter, caplog):
+    """Failed ephemeral plugin commands stay private and never fall through."""
+    adapter.handle_message = AsyncMock()
+    interaction = SimpleNamespace(
+        user=SimpleNamespace(name="Jezza", id=42, display_name="Jezza"),
+        channel=SimpleNamespace(id=123),
+        channel_id=123,
+        guild_id=999,
+        response=SimpleNamespace(defer=AsyncMock()),
+        edit_original_response=AsyncMock(),
+        delete_original_response=AsyncMock(),
+    )
+
+    def handler(_args):
+        raise RuntimeError("database password was not loaded")
+
+    with patch(
+        "hermes_cli.plugins.get_plugin_commands",
+        return_value={
+            "second-brain": {
+                "handler": handler,
+                "description": "Search second brain",
+                "args_hint": "<question>",
+                "plugin": "second-brain",
+                "response_visibility": "ephemeral",
+            }
+        },
+    ), caplog.at_level("WARNING"):
+        await adapter._run_simple_slash(interaction, "/second-brain boom")
+
+    interaction.response.defer.assert_awaited_once_with(ephemeral=True)
+    interaction.edit_original_response.assert_awaited_once_with(
+        content="This command could not be completed. Please try again later."
+    )
+    interaction.delete_original_response.assert_not_awaited()
+    adapter.handle_message.assert_not_awaited()
+    assert "Ephemeral plugin slash dispatch failed" in caplog.text
+
+
 # ------------------------------------------------------------------
 # _handle_thread_create_slash — success, session dispatch, failure
 # ------------------------------------------------------------------

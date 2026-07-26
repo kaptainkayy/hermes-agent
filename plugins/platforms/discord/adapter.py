@@ -3137,8 +3137,8 @@ class DiscordAdapter(BasePlatformAdapter):
         if not pending:
             return False
 
-        self._secondbrain_pending.pop(key, None)
         if time.time() > float(pending.get("expires_at", 0)):
+            self._secondbrain_pending.pop(key, None)
             await channel.send("That Second Brain selection expired. Run `/secondbrain` again.")
             return True
 
@@ -3146,6 +3146,8 @@ class DiscordAdapter(BasePlatformAdapter):
         if not question:
             await channel.send("What would you like to know? Send a question, or run `/secondbrain` again.")
             return True
+
+        pending["expires_at"] = time.time() + 600
 
         thread_id = str(getattr(channel, "id", "")) if isinstance(channel, discord.Thread) else None
         parent_id = self._get_parent_channel_id(channel) if thread_id else None

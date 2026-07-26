@@ -130,7 +130,48 @@ async def test_next_message_starts_opencode_job_and_skips_agent(monkeypatch):
     assert starts[0]["callback_target"] == "discord:123"
     assert channel.send.await_count == 1
     assert "asking OpenCode" in channel.send.await_args.args[0]
-    assert adapter._secondbrain_pending == {}
+
+
+@pytest.mark.asyncio
+async def test_follow_up_messages_keep_pending_selection_and_renew_expiry(monkeypatch):
+    adapter = _adapter()
+    adapter._set_secondbrain_pending(
+        user_id="42",
+        channel_id="123",
+        corpus_key="science",
+        label="Science claims",
+    )
+    start_calls = []
+    original_expiry = adapter._secondbrain_pending[("42", "123")]["expires_at"]
+
+    monkeypatch.setattr(
+        adapter,
+        "_start_secondbrain_opencode_job",
+        lambda **kwargs: start_calls.append(kwargs) or {"status": "queued", "job_id": f"job-{len(start_calls)}"},
+        raising=False,
+    )
+
+    channel = SimpleNamespace(id=123, send=AsyncMock())
+    message = SimpleNamespace(
+        content="question one",
+        channel=channel,
+        author=SimpleNamespace(id=42, display_name="Tester", bot=False),
+        id=777,
+    )
+
+    handled_first = await adapter._maybe_handle_secondbrain_pending_question(message, "question one")
+
+    message.content = "question two"
+    handled_second = await adapter._maybe_handle_secondbrain_pending_question(message, "question two")
+
+    assert handled_first is True
+    assert handled_second is True
+    assert len(start_calls) == 2
+    assert start_calls[0]["question"] == "question one"
+    assert start_calls[1]["question"] == "question two"
+    assert adapter._secondbrain_pending[("42", "123")]["corpus_key"] == "science"
+    renewed_expiry = adapter._secondbrain_pending[("42", "123")]["expires_at"]
+    assert renewed_expiry >= original_expiry
 
 
 @pytest.mark.asyncio

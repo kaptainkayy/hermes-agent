@@ -3073,6 +3073,89 @@ class DiscordAdapter(BasePlatformAdapter):
             "expires_at": time.time() + 600,
         }
 
+    def _secondbrain_callback_target(self, channel_id: str, thread_id: str | None = None) -> str:
+        if thread_id:
+            return f"discord:{channel_id}:{thread_id}"
+        return f"discord:{channel_id}"
+
+    def _build_secondbrain_opencode_prompt(self, *, corpus_key: str, question: str):
+        from hermes_cli.plugins import get_plugin_commands
+        commands = get_plugin_commands()
+        module = sys.modules.get(commands["secondbrain"]["handler"].__module__)
+        if module is None:
+            raise RuntimeError("secondbrain plugin module is not loaded")
+        config = module.load_second_brain_config()
+        connection = module.connect_second_brain_db(config)
+        try:
+            index = module.load_or_refresh_corpus_index(connection)
+            entry = index.get_entry(corpus_key)
+            return module.build_opencode_second_brain_prompt(entry, question, config)
+        finally:
+            connection.close()
+
+    def _start_secondbrain_opencode_job(
+        self,
+        *,
+        corpus_key: str,
+        label: str,
+        question: str,
+        callback_target: str,
+    ) -> dict:
+        prompt = self._build_secondbrain_opencode_prompt(corpus_key=corpus_key, question=question)
+        from tools.registry import registry
+        raw = registry.dispatch(
+            "opencode",
+            {
+                "action": "start_background",
+                "prompt": prompt,
+                "callback_target": callback_target,
+                "timeout": 1800,
+            },
+        )
+        try:
+            return json.loads(raw)
+        except Exception:
+            return {"error": "OpenCode returned an invalid response"}
+
+    async def _maybe_handle_secondbrain_pending_question(self, message: DiscordMessage, event_text: str) -> bool:
+        author = getattr(message, "author", None)
+        channel = getattr(message, "channel", None)
+        if author is None or channel is None:
+            return False
+        if getattr(author, "bot", False):
+            return False
+
+        channel_id = str(getattr(channel, "id", ""))
+        user_id = str(getattr(author, "id", ""))
+        key = self._secondbrain_context_key(user_id, channel_id)
+        pending = self._secondbrain_pending.get(key)
+        if not pending:
+            return False
+
+        self._secondbrain_pending.pop(key, None)
+        if time.time() > float(pending.get("expires_at", 0)):
+            await channel.send("That Second Brain selection expired. Run `/secondbrain` again.")
+            return True
+
+        question = (event_text or "").strip()
+        if not question:
+            await channel.send("What would you like to know? Send a question, or run `/secondbrain` again.")
+            return True
+
+        thread_id = str(getattr(channel, "id", "")) if isinstance(channel, discord.Thread) else None
+        parent_id = self._get_parent_channel_id(channel) if thread_id else None
+        callback_target = self._secondbrain_callback_target(parent_id or channel_id, thread_id)
+        await channel.send("Got it — asking OpenCode. I’ll post the answer here when it’s done.")
+        result = self._start_secondbrain_opencode_job(
+            corpus_key=pending["corpus_key"],
+            label=pending["label"],
+            question=question,
+            callback_target=callback_target,
+        )
+        if result.get("error"):
+            await channel.send(f"OpenCode is unavailable: {result['error']}")
+        return True
+
     def _load_secondbrain_index_for_discord(self):
         from hermes_cli.plugins import get_plugin_commands
 
@@ -4715,6 +4798,9 @@ class DiscordAdapter(BasePlatformAdapter):
                 or is_voice_linked_channel
             )
 
+            if await self._maybe_handle_secondbrain_pending_question(message, normalized_content):
+                return
+
             # Skip the mention check if the message is in a thread where
             # the bot has previously participated (auto-created or replied in)
             # — UNLESS thread_require_mention is enabled, in which case threads
@@ -4982,6 +5068,9 @@ class DiscordAdapter(BasePlatformAdapter):
         # — the context IS the message, so skip the placeholder.
         if (not event_text or not event_text.strip()) and not _channel_context:
             event_text = "(The user sent a message with no text content)"
+
+        if _is_dm and await self._maybe_handle_secondbrain_pending_question(message, event_text):
+            return
 
         _chan = message.channel
         _parent_id = str(getattr(_chan, "parent_id", "") or "")

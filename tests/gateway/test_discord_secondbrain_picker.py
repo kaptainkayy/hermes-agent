@@ -94,3 +94,98 @@ async def test_unauthorized_select_is_rejected():
     assert adapter._secondbrain_pending == {}
     interaction.response.send_message.assert_awaited_once()
     assert interaction.response.send_message.await_args.kwargs["ephemeral"] is True
+
+
+@pytest.mark.asyncio
+async def test_next_message_starts_opencode_job_and_skips_agent(monkeypatch):
+    adapter = _adapter()
+    adapter._set_secondbrain_pending(
+        user_id="42",
+        channel_id="123",
+        corpus_key="science",
+        label="Science claims",
+    )
+    starts = []
+
+    monkeypatch.setattr(
+        adapter,
+        "_start_secondbrain_opencode_job",
+        lambda **kwargs: starts.append(kwargs) or {"status": "queued", "job_id": "job-1"},
+        raising=False,
+    )
+
+    channel = SimpleNamespace(id=123, send=AsyncMock())
+    message = SimpleNamespace(
+        content="what claims mention sleep?",
+        channel=channel,
+        author=SimpleNamespace(id=42, display_name="Tester", bot=False),
+        id=777,
+    )
+
+    handled = await adapter._maybe_handle_secondbrain_pending_question(message, "what claims mention sleep?")
+
+    assert handled is True
+    assert starts[0]["corpus_key"] == "science"
+    assert starts[0]["question"] == "what claims mention sleep?"
+    assert starts[0]["callback_target"] == "discord:123"
+    assert channel.send.await_count == 1
+    assert "asking OpenCode" in channel.send.await_args.args[0]
+    assert adapter._secondbrain_pending == {}
+
+
+@pytest.mark.asyncio
+async def test_expired_pending_selection_asks_user_to_select_again(monkeypatch):
+    adapter = _adapter()
+    adapter._set_secondbrain_pending(
+        user_id="42",
+        channel_id="123",
+        corpus_key="science",
+        label="Science claims",
+    )
+    key = ("42", "123")
+    adapter._secondbrain_pending[key]["expires_at"] = 1
+
+    channel = SimpleNamespace(id=123, send=AsyncMock())
+    message = SimpleNamespace(
+        content="question",
+        channel=channel,
+        author=SimpleNamespace(id=42, display_name="Tester", bot=False),
+        id=777,
+    )
+
+    handled = await adapter._maybe_handle_secondbrain_pending_question(message, "question")
+
+    assert handled is True
+    assert adapter._secondbrain_pending == {}
+    channel.send.assert_awaited_once_with("That Second Brain selection expired. Run `/secondbrain` again.")
+
+
+def test_start_secondbrain_opencode_job_dispatches_tool(monkeypatch):
+    adapter = _adapter()
+    dispatched = []
+
+    class FakeRegistry:
+        def dispatch(self, name, args, **kwargs):
+            dispatched.append((name, args))
+            return '{"status":"queued","job_id":"abc"}'
+
+    monkeypatch.setitem(sys.modules, "tools.registry", type("M", (), {"registry": FakeRegistry()})())
+    monkeypatch.setattr(
+        adapter,
+        "_build_secondbrain_opencode_prompt",
+        lambda **_kwargs: "prompt text",
+        raising=False,
+    )
+
+    result = adapter._start_secondbrain_opencode_job(
+        corpus_key="science",
+        label="Science claims",
+        question="what?",
+        callback_target="discord:123",
+    )
+
+    assert result == {"status": "queued", "job_id": "abc"}
+    assert dispatched[0][0] == "opencode"
+    assert dispatched[0][1]["action"] == "start_background"
+    assert dispatched[0][1]["prompt"] == "prompt text"
+    assert dispatched[0][1]["callback_target"] == "discord:123"

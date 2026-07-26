@@ -94,6 +94,26 @@ def test_component_check_role_only_user_without_matching_role_rejected():
     assert _component_check_auth(interaction, set(), {42}) is False
 
 
+def test_secondbrain_corpus_select_view_accepts_role_allowlist():
+    from plugins.platforms.discord.adapter import SecondBrainCorpusSelectView
+
+    class Index:
+        def enabled_entries(self):
+            return [type("Entry", (), {"key": "science", "label": "Science", "description": "", "row_count": 1})()]
+
+        def get_entry(self, key):
+            return self.enabled_entries()[0]
+
+    view = SecondBrainCorpusSelectView(
+        adapter=object(),
+        index=Index(),
+        allowed_user_ids=set(),
+        allowed_role_ids={42},
+    )
+    assert view._check_auth(_interaction(99999, role_ids=[42])) is True
+    assert view._check_auth(_interaction(99999, role_ids=[7])) is False
+
+
 def test_component_check_user_or_role_user_match():
     """Both allowlists set; user matches user allowlist: pass."""
     interaction = _interaction(11111, role_ids=[7])

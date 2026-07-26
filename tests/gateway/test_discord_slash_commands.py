@@ -293,6 +293,16 @@ async def test_plugin_command_name_conflict_skipped(adapter):
 
 
 @pytest.mark.asyncio
+async def test_explicit_secondbrain_slash_prevents_generic_plugin_registration(adapter):
+    adapter._run_simple_slash = AsyncMock()
+    adapter._register_slash_commands()
+
+    assert "secondbrain" in adapter._client.tree.commands
+    command = adapter._client.tree.commands["secondbrain"]
+    assert getattr(command, "__name__", "") != "auto_slash_secondbrain"
+
+
+@pytest.mark.asyncio
 async def test_ephemeral_plugin_command_edits_interaction_without_channel_dispatch(adapter):
     """Ephemeral plugin commands answer privately without dispatching to the channel."""
     adapter.handle_message = AsyncMock()

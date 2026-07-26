@@ -417,6 +417,7 @@ class PluginContext:
         args_hint: str = "",
         response_visibility: str = "public",
         dispatch: str = "agent",
+        thread_response: bool = False,
     ) -> None:
         """Register a slash command (e.g. ``/lcm``) available in CLI and gateway sessions.
 
@@ -433,6 +434,9 @@ class PluginContext:
         command picker. Plugin commands without ``args_hint`` register as
         parameterless in Discord and still accept trailing text when invoked
         as free-form chat.
+
+        ``thread_response=True`` asks gateway adapters that support threads to
+        create a thread and place the command result there.
 
         Names conflicting with built-in commands are rejected with a warning.
         """
@@ -464,6 +468,7 @@ class PluginContext:
             "args_hint": (args_hint or "").strip(),
             "response_visibility": response_visibility,
             "dispatch": dispatch,
+            "thread_response": bool(thread_response),
         }
         logger.debug("Plugin %s registered command: /%s", self.manifest.name, clean)
 

@@ -1077,6 +1077,18 @@ class TestPluginCommands:
         assert mgr._plugin_commands["agent-cmd"]["dispatch"] == "agent"
         assert mgr._plugin_commands["direct-cmd"]["dispatch"] == "direct"
 
+    def test_register_command_stores_thread_response_metadata(self):
+        """thread_response defaults to false and can be enabled explicitly."""
+        mgr = PluginManager()
+        manifest = PluginManifest(name="test-plugin", source="user")
+        ctx = PluginContext(manifest, mgr)
+
+        ctx.register_command("agent-cmd", lambda a: a)
+        ctx.register_command("threaded-cmd", lambda a: a, thread_response=True)
+
+        assert mgr._plugin_commands["agent-cmd"]["thread_response"] is False
+        assert mgr._plugin_commands["threaded-cmd"]["thread_response"] is True
+
     def test_register_command_args_hint_whitespace_trimmed(self):
         """args_hint leading/trailing whitespace is stripped."""
         mgr = PluginManager()

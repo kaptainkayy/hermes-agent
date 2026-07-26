@@ -409,6 +409,198 @@ async def test_ephemeral_plugin_command_failure_edits_friendly_without_dispatch(
     assert "Ephemeral plugin slash dispatch failed" in caplog.text
 
 
+@pytest.mark.asyncio
+async def test_threaded_direct_plugin_command_creates_thread_and_posts_answer(adapter):
+    adapter.handle_message = AsyncMock()
+    created_thread = SimpleNamespace(id=555, name="what do I know", send=AsyncMock())
+    parent_channel = SimpleNamespace(create_thread=AsyncMock(return_value=created_thread), send=AsyncMock(), id=123)
+    interaction = SimpleNamespace(
+        user=SimpleNamespace(name="Jezza", id=42, display_name="Jezza"),
+        channel=parent_channel,
+        channel_id=123,
+        guild=SimpleNamespace(name="TestGuild"),
+        guild_id=999,
+        response=SimpleNamespace(defer=AsyncMock()),
+        followup=SimpleNamespace(send=AsyncMock()),
+        edit_original_response=AsyncMock(),
+        delete_original_response=AsyncMock(),
+    )
+
+    async def handler(args):
+        return f"cited answer: {args}"
+
+    with patch(
+        "hermes_cli.plugins.get_plugin_commands",
+        return_value={
+            "secondbrain": {
+                "handler": handler,
+                "description": "Search second brain",
+                "args_hint": "<question>",
+                "plugin": "second-brain",
+                "dispatch": "direct",
+                "thread_response": True,
+            }
+        },
+    ):
+        await adapter._run_simple_slash(interaction, "/secondbrain what do I know")
+
+    interaction.response.defer.assert_awaited_once_with(ephemeral=True)
+    parent_channel.create_thread.assert_awaited_once()
+    interaction.followup.send.assert_awaited_once()
+    assert "<#555>" in interaction.followup.send.await_args.args[0]
+    created_thread.send.assert_awaited_once_with("cited answer: what do I know")
+    interaction.edit_original_response.assert_not_awaited()
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_threaded_plugin_command_without_args_returns_usage_without_thread(adapter):
+    created_thread = SimpleNamespace(id=555, name="unused", send=AsyncMock())
+    parent_channel = SimpleNamespace(create_thread=AsyncMock(return_value=created_thread), id=123)
+    interaction = SimpleNamespace(
+        user=SimpleNamespace(name="Jezza", id=42, display_name="Jezza"),
+        channel=parent_channel,
+        channel_id=123,
+        guild_id=999,
+        response=SimpleNamespace(defer=AsyncMock()),
+        followup=SimpleNamespace(send=AsyncMock()),
+        edit_original_response=AsyncMock(),
+        delete_original_response=AsyncMock(),
+    )
+
+    with patch(
+        "hermes_cli.plugins.get_plugin_commands",
+        return_value={
+            "secondbrain": {
+                "handler": lambda _args: "Usage: /secondbrain <question>",
+                "description": "Search second brain",
+                "args_hint": "<question>",
+                "plugin": "second-brain",
+                "dispatch": "direct",
+                "thread_response": True,
+            }
+        },
+    ):
+        await adapter._run_simple_slash(interaction, "/secondbrain")
+
+    parent_channel.create_thread.assert_not_awaited()
+    interaction.edit_original_response.assert_awaited_once_with(content="Usage: /secondbrain <question>")
+
+
+@pytest.mark.asyncio
+async def test_threaded_agent_plugin_command_dispatches_request_to_thread_session(adapter):
+    created_thread = SimpleNamespace(id=555, name="check gateway status", send=AsyncMock())
+    parent_channel = SimpleNamespace(create_thread=AsyncMock(return_value=created_thread), send=AsyncMock(), id=123)
+    interaction = SimpleNamespace(
+        user=SimpleNamespace(name="Jezza", id=42, display_name="Jezza"),
+        channel=parent_channel,
+        channel_id=123,
+        guild=SimpleNamespace(name="TestGuild"),
+        guild_id=999,
+        response=SimpleNamespace(defer=AsyncMock()),
+        followup=SimpleNamespace(send=AsyncMock()),
+        edit_original_response=AsyncMock(),
+        delete_original_response=AsyncMock(),
+    )
+    adapter._dispatch_thread_session = AsyncMock()
+
+    handler = MagicMock(return_value="should not be called for agent dispatch")
+
+    with patch(
+        "hermes_cli.plugins.get_plugin_commands",
+        return_value={
+            "hermes": {
+                "handler": handler,
+                "description": "Ask Hermes",
+                "args_hint": "<request>",
+                "plugin": "hermes-entry",
+                "dispatch": "agent",
+                "thread_response": True,
+            }
+        },
+    ):
+        await adapter._run_simple_slash(interaction, "/hermes check gateway status")
+
+    handler.assert_not_called()
+    adapter._dispatch_thread_session.assert_awaited_once_with(
+        interaction,
+        "555",
+        "check gateway status",
+        "check gateway status",
+    )
+
+
+@pytest.mark.asyncio
+async def test_threaded_plugin_command_reports_thread_creation_failure(adapter):
+    channel = SimpleNamespace(
+        create_thread=AsyncMock(side_effect=RuntimeError("direct failed")),
+        send=AsyncMock(side_effect=RuntimeError("fallback failed")),
+    )
+    interaction = SimpleNamespace(
+        user=SimpleNamespace(name="Jezza", id=42, display_name="Jezza"),
+        channel=channel,
+        channel_id=123,
+        guild=SimpleNamespace(name="TestGuild"),
+        response=SimpleNamespace(defer=AsyncMock()),
+        followup=SimpleNamespace(send=AsyncMock()),
+        edit_original_response=AsyncMock(),
+        delete_original_response=AsyncMock(),
+    )
+
+    with patch(
+        "hermes_cli.plugins.get_plugin_commands",
+        return_value={
+            "secondbrain": {
+                "handler": lambda _args: "answer",
+                "description": "Search second brain",
+                "args_hint": "<question>",
+                "plugin": "second-brain",
+                "dispatch": "direct",
+                "thread_response": True,
+            }
+        },
+    ):
+        await adapter._run_simple_slash(interaction, "/secondbrain anything")
+
+    interaction.followup.send.assert_awaited_once()
+    assert "Failed to create thread:" in interaction.followup.send.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_threaded_plugin_invoked_inside_thread_creates_sibling_under_parent(adapter):
+    created_thread = SimpleNamespace(id=555, name="sibling", send=AsyncMock())
+    parent_channel = SimpleNamespace(id=999, create_thread=AsyncMock(return_value=created_thread), send=AsyncMock())
+    current_thread = SimpleNamespace(id=444, parent=parent_channel)
+    interaction = SimpleNamespace(
+        user=SimpleNamespace(name="Jezza", id=42, display_name="Jezza"),
+        channel=current_thread,
+        channel_id=444,
+        guild=SimpleNamespace(name="TestGuild"),
+        guild_id=999,
+        response=SimpleNamespace(defer=AsyncMock()),
+        followup=SimpleNamespace(send=AsyncMock()),
+        edit_original_response=AsyncMock(),
+    )
+
+    with patch(
+        "hermes_cli.plugins.get_plugin_commands",
+        return_value={
+            "secondbrain": {
+                "handler": lambda _args: "answer",
+                "description": "Search second brain",
+                "args_hint": "<question>",
+                "plugin": "second-brain",
+                "dispatch": "direct",
+                "thread_response": True,
+            }
+        },
+    ):
+        await adapter._run_simple_slash(interaction, "/secondbrain sibling question")
+
+    parent_channel.create_thread.assert_awaited_once()
+    created_thread.send.assert_awaited_once_with("answer")
+
+
 # ------------------------------------------------------------------
 # _handle_thread_create_slash — success, session dispatch, failure
 # ------------------------------------------------------------------
@@ -608,6 +800,24 @@ def test_build_slash_event_uses_group_context_for_channels(adapter):
 # ------------------------------------------------------------------
 # Auto-thread: _auto_create_thread
 # ------------------------------------------------------------------
+
+
+def test_sanitize_thread_title_strips_mentions_and_collapses_spaces(adapter):
+    title = adapter._sanitize_thread_title("<@123>  compare   Cole Medin <#456> agents")
+
+    assert title == "compare Cole Medin agents"
+
+
+def test_sanitize_thread_title_uses_default_for_empty_or_mentions_only(adapter):
+    assert adapter._sanitize_thread_title("<@123> <#456>") == "Hermes"
+    assert adapter._sanitize_thread_title("", default="Inquiry") == "Inquiry"
+
+
+def test_sanitize_thread_title_truncates_to_80_chars(adapter):
+    title = adapter._sanitize_thread_title("a" * 200)
+
+    assert len(title) == 80
+    assert title.endswith("...")
 
 
 @pytest.mark.asyncio

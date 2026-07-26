@@ -2915,31 +2915,39 @@ class DiscordAdapter(BasePlatformAdapter):
         if not await self._check_slash_authorization(interaction, command_text):
             return
 
-        await interaction.response.defer(ephemeral=True)
-
         command_name, _, raw_args = command_text.lstrip("/").partition(" ")
         try:
             from hermes_cli.plugins import get_plugin_commands
 
             plugin_command = get_plugin_commands().get(command_name.replace("_", "-"))
-            if plugin_command and plugin_command.get("dispatch") == "direct":
+        except Exception:
+            plugin_command = None
+
+        if plugin_command and plugin_command.get("thread_response"):
+            await self._run_threaded_plugin_slash(interaction, command_text, plugin_command)
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        if plugin_command and plugin_command.get("dispatch") == "direct":
+            try:
                 result = plugin_command["handler"](raw_args.strip())
                 if asyncio.iscoroutine(result):
                     result = await result
                 await interaction.edit_original_response(content=str(result) if result else "")
                 return
-        except Exception as e:
-            logger.warning("Ephemeral plugin slash dispatch failed: %s", e)
-            try:
-                await interaction.edit_original_response(
-                    content="This command could not be completed. Please try again later."
-                )
-            except Exception as edit_error:
-                logger.warning(
-                    "Could not edit ephemeral plugin slash failure response: %s",
-                    edit_error,
-                )
-            return
+            except Exception as e:
+                logger.warning("Ephemeral plugin slash dispatch failed: %s", e)
+                try:
+                    await interaction.edit_original_response(
+                        content="This command could not be completed. Please try again later."
+                    )
+                except Exception as edit_error:
+                    logger.warning(
+                        "Could not edit ephemeral plugin slash failure response: %s",
+                        edit_error,
+                    )
+                return
 
         event = self._build_slash_event(interaction, command_text)
         await self.handle_message(event)
@@ -2950,6 +2958,108 @@ class DiscordAdapter(BasePlatformAdapter):
                 await interaction.delete_original_response()
         except Exception as e:
             logger.debug("Discord interaction cleanup failed: %s", e)
+
+    async def _run_threaded_plugin_slash(
+        self,
+        interaction: discord.Interaction,
+        command_text: str,
+        plugin_command: Dict[str, Any],
+    ) -> None:
+        command_name, _, raw_args = command_text.lstrip("/").partition(" ")
+        args = raw_args.strip()
+
+        await interaction.response.defer(ephemeral=True)
+
+        if not args:
+            try:
+                result = plugin_command["handler"](args)
+                if asyncio.iscoroutine(result):
+                    result = await result
+            except Exception as e:
+                logger.warning("Ephemeral plugin slash dispatch failed: %s", e)
+                try:
+                    await interaction.edit_original_response(
+                        content="This command could not be completed. Please try again later."
+                    )
+                except Exception as edit_error:
+                    logger.warning(
+                        "Could not edit ephemeral plugin slash failure response: %s",
+                        edit_error,
+                    )
+                return
+
+            await interaction.edit_original_response(
+                content=str(result) if result else f"Usage: /{command_name} <request>"
+            )
+            return
+
+        thread_name = self._sanitize_thread_title(args, default=command_name)
+        result = await self._create_thread(
+            interaction,
+            name=thread_name,
+            message="",
+            auto_archive_duration=1440,
+        )
+        if not result.get("success"):
+            error = result.get("error", "unknown error")
+            await interaction.followup.send(f"Failed to create thread: {error}", ephemeral=True)
+            return
+
+        thread_id = result.get("thread_id")
+        thread_name = result.get("thread_name") or thread_name
+        thread = result.get("thread")
+        link = f"<#{thread_id}>" if thread_id else f"**{thread_name}**"
+        await interaction.followup.send(f"Created thread {link}", ephemeral=True)
+        if thread_id:
+            self._threads.mark(thread_id)
+
+        if plugin_command.get("dispatch") == "direct":
+            try:
+                answer = plugin_command["handler"](args)
+                if asyncio.iscoroutine(answer):
+                    answer = await answer
+            except Exception as e:
+                logger.warning("Threaded plugin slash dispatch failed: %s", e)
+                try:
+                    await interaction.edit_original_response(
+                        content="This command could not be completed. Please try again later."
+                    )
+                except Exception as edit_error:
+                    logger.warning(
+                        "Could not edit ephemeral plugin slash failure response: %s",
+                        edit_error,
+                    )
+                return
+
+            if thread is not None and answer:
+                await self._send_text_to_thread(thread, str(answer))
+            return
+
+        if thread_id:
+            await self._dispatch_thread_session(
+                interaction,
+                thread_id,
+                thread_name,
+                args,
+            )
+
+    @staticmethod
+    def _sanitize_thread_title(text: str, default: str = "Hermes", max_len: int = 80) -> str:
+        content = (text or "").strip()
+        content = re.sub(r"<@[!&]?\d+>", "", content)
+        content = re.sub(r"<#\d+>", "", content)
+        content = re.sub(r"\s+", " ", content).strip()
+        if not content:
+            content = default
+        if len(content) > max_len:
+            return content[: max_len - 3] + "..."
+        return content
+
+    async def _send_text_to_thread(self, thread: Any, content: str) -> None:
+        formatted = self.format_message(content or "")
+        chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+        for chunk in chunks:
+            await thread.send(chunk)
 
     def _register_slash_commands(self) -> None:
         """Register Discord slash commands on the command tree."""
@@ -3905,6 +4015,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 "success": True,
                 "thread_id": str(thread.id),
                 "thread_name": getattr(thread, "name", None) or name,
+                "thread": thread,
             }
         except Exception as direct_error:
             try:
@@ -3919,6 +4030,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     "success": True,
                     "thread_id": str(thread.id),
                     "thread_name": getattr(thread, "name", None) or name,
+                    "thread": thread,
                 }
             except Exception as fallback_error:
                 return {
@@ -3937,18 +4049,7 @@ class DiscordAdapter(BasePlatformAdapter):
 
         Returns the created thread object, or ``None`` on failure.
         """
-        # Build a short thread name from the message. Strip Discord mention
-        # syntax (users / roles / channels) so thread titles don't end up
-        # showing raw <@id>, <@&id>, or <#id> markers — the ID isn't
-        # meaningful to humans glancing at the thread list (#6336).
-        content = (message.content or "").strip()
-        # <@123>, <@!123>, <@&123>, <#123> — collapse to empty; normalize spaces.
-        content = re.sub(r"<@[!&]?\d+>", "", content)
-        content = re.sub(r"<#\d+>", "", content)
-        content = re.sub(r"\s+", " ", content).strip()
-        thread_name = content[:80] if content else "Hermes"
-        if len(content) > 80:
-            thread_name = thread_name[:77] + "..."
+        thread_name = self._sanitize_thread_title(message.content or "")
 
         try:
             thread = await message.create_thread(name=thread_name, auto_archive_duration=1440)

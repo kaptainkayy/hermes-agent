@@ -189,3 +189,88 @@ def test_start_secondbrain_opencode_job_dispatches_tool(monkeypatch):
     assert dispatched[0][1]["action"] == "start_background"
     assert dispatched[0][1]["prompt"] == "prompt text"
     assert dispatched[0][1]["callback_target"] == "discord:123"
+
+
+def test_start_secondbrain_opencode_job_returns_safe_error_if_prompt_build_fails(monkeypatch):
+    adapter = _adapter()
+
+    class FakeRegistry:
+        def dispatch(self, name, args, **kwargs):
+            raise AssertionError("registry.dispatch should not be called")
+
+    monkeypatch.setitem(sys.modules, "tools.registry", type("M", (), {"registry": FakeRegistry()})())
+    monkeypatch.setattr(
+        adapter,
+        "_build_secondbrain_opencode_prompt",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("secret trace")),
+        raising=False,
+    )
+
+    result = adapter._start_secondbrain_opencode_job(
+        corpus_key="science",
+        label="Science claims",
+        question="what?",
+        callback_target="discord:123",
+    )
+
+    assert result == {"error": "OpenCode is unavailable"}
+
+
+def test_start_secondbrain_opencode_job_returns_safe_error_if_dispatch_fails(monkeypatch):
+    adapter = _adapter()
+
+    class FakeRegistry:
+        def dispatch(self, name, args, **kwargs):
+            raise RuntimeError("boom")
+
+    monkeypatch.setitem(sys.modules, "tools.registry", type("M", (), {"registry": FakeRegistry()})())
+    monkeypatch.setattr(
+        adapter,
+        "_build_secondbrain_opencode_prompt",
+        lambda **_kwargs: "prompt text",
+        raising=False,
+    )
+
+    result = adapter._start_secondbrain_opencode_job(
+        corpus_key="science",
+        label="Science claims",
+        question="what?",
+        callback_target="discord:123",
+    )
+
+    assert result == {"error": "OpenCode is unavailable"}
+
+
+@pytest.mark.asyncio
+async def test_pending_question_shows_fixed_unavailable_message(monkeypatch):
+    adapter = _adapter()
+    adapter._set_secondbrain_pending(
+        user_id="42",
+        channel_id="123",
+        corpus_key="science",
+        label="Science claims",
+    )
+
+    monkeypatch.setattr(
+        adapter,
+        "_start_secondbrain_opencode_job",
+        lambda **_kwargs: {"error": "OpenCode is unavailable"},
+    )
+
+    channel = SimpleNamespace(id=123, send=AsyncMock())
+    message = SimpleNamespace(
+        content="question",
+        channel=channel,
+        author=SimpleNamespace(id=42, display_name="Tester", bot=False),
+        id=777,
+    )
+
+    handled = await adapter._maybe_handle_secondbrain_pending_question(message, "question")
+
+    assert handled is True
+    assert channel.send.await_count == 2
+    assert channel.send.await_args_list[0].args[0].startswith("Got it")
+    assert "OpenCode is unavailable. Please try again in a moment." == channel.send.await_args_list[1].args[0]
+
+    for call in channel.send.await_args_list:
+        assert "OpenCode is unavailable: " not in call.args[0]

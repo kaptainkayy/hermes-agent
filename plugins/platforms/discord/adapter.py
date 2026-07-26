@@ -3101,21 +3101,26 @@ class DiscordAdapter(BasePlatformAdapter):
         question: str,
         callback_target: str,
     ) -> dict:
-        prompt = self._build_secondbrain_opencode_prompt(corpus_key=corpus_key, question=question)
-        from tools.registry import registry
-        raw = registry.dispatch(
-            "opencode",
-            {
-                "action": "start_background",
-                "prompt": prompt,
-                "callback_target": callback_target,
-                "timeout": 1800,
-            },
-        )
         try:
+            prompt = self._build_secondbrain_opencode_prompt(corpus_key=corpus_key, question=question)
+        except Exception:
+            logger.warning("Failed to build Second Brain OpenCode prompt")
+            return {"error": "OpenCode is unavailable"}
+        from tools.registry import registry
+        try:
+            raw = registry.dispatch(
+                "opencode",
+                {
+                    "action": "start_background",
+                    "prompt": prompt,
+                    "callback_target": callback_target,
+                    "timeout": 1800,
+                },
+            )
             return json.loads(raw)
         except Exception:
-            return {"error": "OpenCode returned an invalid response"}
+            logger.warning("Second Brain OpenCode dispatch failed")
+            return {"error": "OpenCode is unavailable"}
 
     async def _maybe_handle_secondbrain_pending_question(self, message: DiscordMessage, event_text: str) -> bool:
         author = getattr(message, "author", None)
@@ -3153,7 +3158,7 @@ class DiscordAdapter(BasePlatformAdapter):
             callback_target=callback_target,
         )
         if result.get("error"):
-            await channel.send(f"OpenCode is unavailable: {result['error']}")
+            await channel.send("OpenCode is unavailable. Please try again in a moment.")
         return True
 
     def _load_secondbrain_index_for_discord(self):

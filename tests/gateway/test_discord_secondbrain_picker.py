@@ -129,13 +129,48 @@ async def test_next_message_answers_via_plugin_api_and_skips_opencode_job(monkey
         corpus_key="science",
         label="Science claims",
     )
-    opencode_calls = []
     answer_api = _fake_secondbrain_plugin(monkeypatch, ["Answer: sleep supports memory consolidation."])
+
+    channel = SimpleNamespace(id=123, send=AsyncMock())
+    message = SimpleNamespace(
+        content="what claims mention sleep?",
+        channel=channel,
+        author=SimpleNamespace(id=42, display_name="Tester", bot=False),
+        id=777,
+    )
+
+    handled = await adapter._maybe_handle_secondbrain_pending_question(message, "what claims mention sleep?")
+
+    assert handled is True
+    assert answer_api.await_count == 1
+    assert answer_api.await_args.args[1] == "what claims mention sleep?"
+    assert answer_api.await_args.args[2] == "science"
+    assert channel.send.await_count == 2
+    assert channel.send.await_args_list[0].args[0].startswith("Got it")
+    assert channel.send.await_args_list[1].args[0] == "Answer: sleep supports memory consolidation."
+
+
+@pytest.mark.asyncio
+async def test_next_message_pending_flow_does_not_call_opencode_callback_target(monkeypatch):
+    adapter = _adapter()
+    adapter._set_secondbrain_pending(
+        user_id="42",
+        channel_id="123",
+        corpus_key="science",
+        label="Science claims",
+    )
+    answer_api = _fake_secondbrain_plugin(monkeypatch, ["Answer from plugin API"])
+
+    callback_target_calls = {}
+
+    def _unexpected_callback_target(*_args, **_kwargs):
+        callback_target_calls["called"] = True
+        return "unexpected"
 
     monkeypatch.setattr(
         adapter,
-        "_start_secondbrain_opencode_job",
-        lambda **kwargs: opencode_calls.append(kwargs) or {"status": "queued", "job_id": "job-1"},
+        "_secondbrain_callback_target",
+        _unexpected_callback_target,
         raising=False,
     )
 
@@ -150,13 +185,15 @@ async def test_next_message_answers_via_plugin_api_and_skips_opencode_job(monkey
     handled = await adapter._maybe_handle_secondbrain_pending_question(message, "what claims mention sleep?")
 
     assert handled is True
-    assert opencode_calls == []
     assert answer_api.await_count == 1
-    assert answer_api.await_args.args[1] == "what claims mention sleep?"
-    assert answer_api.await_args.args[2] == "science"
-    assert channel.send.await_count == 2
-    assert channel.send.await_args_list[0].args[0].startswith("Got it")
-    assert channel.send.await_args_list[1].args[0] == "Answer: sleep supports memory consolidation."
+    assert callback_target_calls == {}
+
+
+def test_secondbrain_pending_flow_removed_opencode_surface_helpers():
+    adapter = _adapter()
+    assert not hasattr(type(adapter), "_start_secondbrain_opencode_job")
+    assert not hasattr(type(adapter), "_build_secondbrain_opencode_prompt")
+    assert not hasattr(type(adapter), "_secondbrain_callback_target")
 
 
 @pytest.mark.asyncio
@@ -168,19 +205,11 @@ async def test_follow_up_messages_keep_pending_selection_and_renew_expiry(monkey
         corpus_key="science",
         label="Science claims",
     )
-    start_calls = []
     answer_api = _fake_secondbrain_plugin(
         monkeypatch,
         ["Answer one", "Answer two"],
     )
     original_expiry = adapter._secondbrain_pending[("42", "123")]["expires_at"]
-
-    monkeypatch.setattr(
-        adapter,
-        "_start_secondbrain_opencode_job",
-        lambda **kwargs: start_calls.append(kwargs) or {"status": "queued", "job_id": f"job-{len(start_calls)}"},
-        raising=False,
-    )
 
     channel = SimpleNamespace(id=123, send=AsyncMock())
     message = SimpleNamespace(
@@ -197,7 +226,6 @@ async def test_follow_up_messages_keep_pending_selection_and_renew_expiry(monkey
 
     assert handled_first is True
     assert handled_second is True
-    assert start_calls == []
     assert answer_api.await_count == 2
     assert answer_api.await_args_list[0].args[1] == "question one"
     assert answer_api.await_args_list[1].args[1] == "question two"
@@ -233,87 +261,6 @@ async def test_expired_pending_selection_asks_user_to_select_again(monkeypatch):
     assert handled is True
     assert adapter._secondbrain_pending == {}
     channel.send.assert_awaited_once_with("That Second Brain selection expired. Run `/secondbrain` again.")
-
-
-def test_start_secondbrain_opencode_job_dispatches_tool(monkeypatch):
-    adapter = _adapter()
-    dispatched = []
-
-    class FakeRegistry:
-        def dispatch(self, name, args, **kwargs):
-            dispatched.append((name, args))
-            return '{"status":"queued","job_id":"abc"}'
-
-    monkeypatch.setitem(sys.modules, "tools.registry", type("M", (), {"registry": FakeRegistry()})())
-    monkeypatch.setattr(
-        adapter,
-        "_build_secondbrain_opencode_prompt",
-        lambda **_kwargs: "prompt text",
-        raising=False,
-    )
-
-    result = adapter._start_secondbrain_opencode_job(
-        corpus_key="science",
-        label="Science claims",
-        question="what?",
-        callback_target="discord:123",
-    )
-
-    assert result == {"status": "queued", "job_id": "abc"}
-    assert dispatched[0][0] == "opencode"
-    assert dispatched[0][1]["action"] == "start_background"
-    assert dispatched[0][1]["prompt"] == "prompt text"
-    assert dispatched[0][1]["callback_target"] == "discord:123"
-
-
-def test_start_secondbrain_opencode_job_returns_safe_error_if_prompt_build_fails(monkeypatch):
-    adapter = _adapter()
-
-    class FakeRegistry:
-        def dispatch(self, name, args, **kwargs):
-            raise AssertionError("registry.dispatch should not be called")
-
-    monkeypatch.setitem(sys.modules, "tools.registry", type("M", (), {"registry": FakeRegistry()})())
-    monkeypatch.setattr(
-        adapter,
-        "_build_secondbrain_opencode_prompt",
-        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("secret trace")),
-        raising=False,
-    )
-
-    result = adapter._start_secondbrain_opencode_job(
-        corpus_key="science",
-        label="Science claims",
-        question="what?",
-        callback_target="discord:123",
-    )
-
-    assert result == {"error": "OpenCode is unavailable"}
-
-
-def test_start_secondbrain_opencode_job_returns_safe_error_if_dispatch_fails(monkeypatch):
-    adapter = _adapter()
-
-    class FakeRegistry:
-        def dispatch(self, name, args, **kwargs):
-            raise RuntimeError("boom")
-
-    monkeypatch.setitem(sys.modules, "tools.registry", type("M", (), {"registry": FakeRegistry()})())
-    monkeypatch.setattr(
-        adapter,
-        "_build_secondbrain_opencode_prompt",
-        lambda **_kwargs: "prompt text",
-        raising=False,
-    )
-
-    result = adapter._start_secondbrain_opencode_job(
-        corpus_key="science",
-        label="Science claims",
-        question="what?",
-        callback_target="discord:123",
-    )
-
-    assert result == {"error": "OpenCode is unavailable"}
 
 
 @pytest.mark.asyncio

@@ -3073,11 +3073,6 @@ class DiscordAdapter(BasePlatformAdapter):
             "expires_at": time.time() + 600,
         }
 
-    def _secondbrain_callback_target(self, channel_id: str, thread_id: str | None = None) -> str:
-        if thread_id:
-            return f"discord:{channel_id}:{thread_id}"
-        return f"discord:{channel_id}"
-
     def _get_secondbrain_answer_api(self):
         from hermes_cli.plugins import get_plugin_commands
         commands = get_plugin_commands()
@@ -3107,50 +3102,6 @@ class DiscordAdapter(BasePlatformAdapter):
 
         return SimpleNamespace(llm=PluginLlm(plugin_id=plugin_name))
 
-    def _build_secondbrain_opencode_prompt(self, *, corpus_key: str, question: str):
-        from hermes_cli.plugins import get_plugin_commands
-        commands = get_plugin_commands()
-        module = sys.modules.get(commands["secondbrain"]["handler"].__module__)
-        if module is None:
-            raise RuntimeError("secondbrain plugin module is not loaded")
-        config = module.load_second_brain_config()
-        connection = module.connect_second_brain_db(config)
-        try:
-            index = module.load_or_refresh_corpus_index(connection)
-            entry = index.get_entry(corpus_key)
-            return module.build_opencode_second_brain_prompt(entry, question, config)
-        finally:
-            connection.close()
-
-    def _start_secondbrain_opencode_job(
-        self,
-        *,
-        corpus_key: str,
-        label: str,
-        question: str,
-        callback_target: str,
-    ) -> dict:
-        try:
-            prompt = self._build_secondbrain_opencode_prompt(corpus_key=corpus_key, question=question)
-        except Exception:
-            logger.warning("Failed to build Second Brain OpenCode prompt")
-            return {"error": "OpenCode is unavailable"}
-        from tools.registry import registry
-        try:
-            raw = registry.dispatch(
-                "opencode",
-                {
-                    "action": "start_background",
-                    "prompt": prompt,
-                    "callback_target": callback_target,
-                    "timeout": 1800,
-                },
-            )
-            return json.loads(raw)
-        except Exception:
-            logger.warning("Second Brain OpenCode dispatch failed")
-            return {"error": "OpenCode is unavailable"}
-
     async def _maybe_handle_secondbrain_pending_question(self, message: DiscordMessage, event_text: str) -> bool:
         author = getattr(message, "author", None)
         channel = getattr(message, "channel", None)
@@ -3178,9 +3129,6 @@ class DiscordAdapter(BasePlatformAdapter):
 
         pending["expires_at"] = time.time() + 600
 
-        thread_id = str(getattr(channel, "id", "")) if isinstance(channel, discord.Thread) else None
-        parent_id = self._get_parent_channel_id(channel) if thread_id else None
-        _ = self._secondbrain_callback_target(parent_id or channel_id, thread_id)
         await channel.send("Got it — I’ll answer from your Second Brain selection.")
 
         plugin_name, answer_api, error = self._get_secondbrain_answer_api()

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from types import SimpleNamespace
+from types import SimpleNamespace, ModuleType
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -39,6 +39,30 @@ def _interaction(user_id="42", channel_id=123):
 
 def _entry(key="science", label="Science claims"):
     return SimpleNamespace(key=key, label=label, description="Claims and evidence", row_count=3, aliases=[key])
+
+
+def _fake_secondbrain_plugin(monkeypatch, answers):
+    module = ModuleType("fake_secondbrain_plugin")
+    module.answer_second_brain_question = AsyncMock(side_effect=answers)
+
+    async def handler(raw_args: str):
+        return ""
+
+    handler.__module__ = "fake_secondbrain_plugin"
+
+    monkeypatch.setitem(sys.modules, "fake_secondbrain_plugin", module)
+    monkeypatch.setattr(
+        sys.modules["hermes_cli.plugins"],
+        "get_plugin_commands",
+        lambda: {
+            "secondbrain": {
+                "handler": handler,
+                "plugin": "second-brain",
+            }
+        },
+        raising=False,
+    )
+    return module.answer_second_brain_question
 
 
 class FakeIndex:
@@ -97,7 +121,7 @@ async def test_unauthorized_select_is_rejected():
 
 
 @pytest.mark.asyncio
-async def test_next_message_starts_opencode_job_and_skips_agent(monkeypatch):
+async def test_next_message_answers_via_plugin_api_and_skips_opencode_job(monkeypatch):
     adapter = _adapter()
     adapter._set_secondbrain_pending(
         user_id="42",
@@ -105,12 +129,13 @@ async def test_next_message_starts_opencode_job_and_skips_agent(monkeypatch):
         corpus_key="science",
         label="Science claims",
     )
-    starts = []
+    opencode_calls = []
+    answer_api = _fake_secondbrain_plugin(monkeypatch, ["Answer: sleep supports memory consolidation."])
 
     monkeypatch.setattr(
         adapter,
         "_start_secondbrain_opencode_job",
-        lambda **kwargs: starts.append(kwargs) or {"status": "queued", "job_id": "job-1"},
+        lambda **kwargs: opencode_calls.append(kwargs) or {"status": "queued", "job_id": "job-1"},
         raising=False,
     )
 
@@ -125,11 +150,13 @@ async def test_next_message_starts_opencode_job_and_skips_agent(monkeypatch):
     handled = await adapter._maybe_handle_secondbrain_pending_question(message, "what claims mention sleep?")
 
     assert handled is True
-    assert starts[0]["corpus_key"] == "science"
-    assert starts[0]["question"] == "what claims mention sleep?"
-    assert starts[0]["callback_target"] == "discord:123"
-    assert channel.send.await_count == 1
-    assert "asking OpenCode" in channel.send.await_args.args[0]
+    assert opencode_calls == []
+    assert answer_api.await_count == 1
+    assert answer_api.await_args.args[1] == "what claims mention sleep?"
+    assert answer_api.await_args.args[2] == "science"
+    assert channel.send.await_count == 2
+    assert channel.send.await_args_list[0].args[0].startswith("Got it")
+    assert channel.send.await_args_list[1].args[0] == "Answer: sleep supports memory consolidation."
 
 
 @pytest.mark.asyncio
@@ -142,6 +169,10 @@ async def test_follow_up_messages_keep_pending_selection_and_renew_expiry(monkey
         label="Science claims",
     )
     start_calls = []
+    answer_api = _fake_secondbrain_plugin(
+        monkeypatch,
+        ["Answer one", "Answer two"],
+    )
     original_expiry = adapter._secondbrain_pending[("42", "123")]["expires_at"]
 
     monkeypatch.setattr(
@@ -166,9 +197,12 @@ async def test_follow_up_messages_keep_pending_selection_and_renew_expiry(monkey
 
     assert handled_first is True
     assert handled_second is True
-    assert len(start_calls) == 2
-    assert start_calls[0]["question"] == "question one"
-    assert start_calls[1]["question"] == "question two"
+    assert start_calls == []
+    assert answer_api.await_count == 2
+    assert answer_api.await_args_list[0].args[1] == "question one"
+    assert answer_api.await_args_list[1].args[1] == "question two"
+    assert answer_api.await_args_list[0].args[2] == "science"
+    assert answer_api.await_args_list[1].args[2] == "science"
     assert adapter._secondbrain_pending[("42", "123")]["corpus_key"] == "science"
     renewed_expiry = adapter._secondbrain_pending[("42", "123")]["expires_at"]
     assert renewed_expiry >= original_expiry
@@ -292,10 +326,25 @@ async def test_pending_question_shows_fixed_unavailable_message(monkeypatch):
         label="Science claims",
     )
 
+    module = ModuleType("fake_secondbrain_plugin")
+    module.answer_second_brain_question = AsyncMock(side_effect=RuntimeError("fail"))
+
+    async def handler(raw_args: str):
+        return ""
+
+    handler.__module__ = "fake_secondbrain_plugin"
+
+    monkeypatch.setitem(sys.modules, "fake_secondbrain_plugin", module)
     monkeypatch.setattr(
-        adapter,
-        "_start_secondbrain_opencode_job",
-        lambda **_kwargs: {"error": "OpenCode is unavailable"},
+        sys.modules["hermes_cli.plugins"],
+        "get_plugin_commands",
+        lambda: {
+            "secondbrain": {
+                "handler": handler,
+                "plugin": "second-brain",
+            }
+        },
+        raising=False,
     )
 
     channel = SimpleNamespace(id=123, send=AsyncMock())
@@ -311,7 +360,10 @@ async def test_pending_question_shows_fixed_unavailable_message(monkeypatch):
     assert handled is True
     assert channel.send.await_count == 2
     assert channel.send.await_args_list[0].args[0].startswith("Got it")
-    assert "OpenCode is unavailable. Please try again in a moment." == channel.send.await_args_list[1].args[0]
+    assert "Second Brain is unavailable. Please try again in a moment." == channel.send.await_args_list[1].args[0]
+
+    for call in channel.send.await_args_list:
+        assert "OpenCode" not in call.args[0]
 
     for call in channel.send.await_args_list:
         assert "OpenCode is unavailable: " not in call.args[0]

@@ -3078,6 +3078,35 @@ class DiscordAdapter(BasePlatformAdapter):
             return f"discord:{channel_id}:{thread_id}"
         return f"discord:{channel_id}"
 
+    def _get_secondbrain_answer_api(self):
+        from hermes_cli.plugins import get_plugin_commands
+        commands = get_plugin_commands()
+        secondbrain = commands.get("secondbrain")
+        if not secondbrain:
+            return None, None, "Second Brain command is unavailable."
+
+        handler = secondbrain.get("handler")
+        plugin_name = secondbrain.get("plugin") or "second-brain"
+        if handler is None:
+            return None, None, "Second Brain handler is unavailable."
+
+        module_name = getattr(handler, "__module__", "")
+        module = sys.modules.get(module_name)
+        if module is None:
+            return None, None, "Second Brain plugin module is not loaded."
+
+        answer_api = getattr(module, "answer_second_brain_question", None)
+        if not callable(answer_api):
+            return None, None, "Second Brain answer API is unavailable."
+
+        return plugin_name, answer_api, None
+
+    def _new_secondbrain_context(self, plugin_name: str):
+        from agent.plugin_llm import PluginLlm
+        from types import SimpleNamespace
+
+        return SimpleNamespace(llm=PluginLlm(plugin_id=plugin_name))
+
     def _build_secondbrain_opencode_prompt(self, *, corpus_key: str, question: str):
         from hermes_cli.plugins import get_plugin_commands
         commands = get_plugin_commands()
@@ -3151,16 +3180,33 @@ class DiscordAdapter(BasePlatformAdapter):
 
         thread_id = str(getattr(channel, "id", "")) if isinstance(channel, discord.Thread) else None
         parent_id = self._get_parent_channel_id(channel) if thread_id else None
-        callback_target = self._secondbrain_callback_target(parent_id or channel_id, thread_id)
-        await channel.send("Got it — asking OpenCode. I’ll post the answer here when it’s done.")
-        result = self._start_secondbrain_opencode_job(
-            corpus_key=pending["corpus_key"],
-            label=pending["label"],
-            question=question,
-            callback_target=callback_target,
-        )
-        if result.get("error"):
-            await channel.send("OpenCode is unavailable. Please try again in a moment.")
+        _ = self._secondbrain_callback_target(parent_id or channel_id, thread_id)
+        await channel.send("Got it — I’ll answer from your Second Brain selection.")
+
+        plugin_name, answer_api, error = self._get_secondbrain_answer_api()
+        if error is not None:
+            logger.warning("Second Brain API unavailable for pending question: %s", error)
+            await channel.send("Second Brain is unavailable. Please try again in a moment.")
+            return True
+
+        try:
+            context = self._new_secondbrain_context(plugin_name)
+        except Exception:
+            from types import SimpleNamespace
+
+            logger.warning("Second Brain plugin context unavailable for pending question")
+            context = SimpleNamespace(llm=None)
+
+        try:
+            answer = await answer_api(context, question, pending["corpus_key"])
+        except Exception:
+            logger.warning("Second Brain answer API call failed for pending question")
+            await channel.send("Second Brain is unavailable. Please try again in a moment.")
+            return True
+
+        if not answer:
+            answer = "I couldn’t produce a Second Brain answer. Please try again in a moment."
+        await channel.send(answer)
         return True
 
     def _load_secondbrain_index_for_discord(self):

@@ -151,6 +151,36 @@ async def test_next_message_answers_via_plugin_api_and_skips_opencode_job(monkey
 
 
 @pytest.mark.asyncio
+async def test_next_message_selected_question_ignores_second_brain_dm_target(monkeypatch):
+    adapter = _adapter()
+    adapter._set_secondbrain_pending(
+        user_id="42",
+        channel_id="123",
+        corpus_key="science",
+        label="Science claims",
+    )
+    answer_api = _fake_secondbrain_plugin(monkeypatch, ["Scoped second-brain answer."])
+    monkeypatch.setenv("SECOND_BRAIN_DISCORD_DM_TARGET", "discord:sentinel-dm-target")
+
+    channel = SimpleNamespace(id=123, send=AsyncMock())
+    message = SimpleNamespace(
+        content="what claims mention sleep?",
+        channel=channel,
+        author=SimpleNamespace(id=42, display_name="Tester", bot=False),
+        id=777,
+    )
+
+    handled = await adapter._maybe_handle_secondbrain_pending_question(message, "what claims mention sleep?")
+
+    assert handled is True
+    assert answer_api.await_count == 1
+    assert channel.send.await_args_list[0].args[0].startswith("Got it")
+    assert channel.send.await_args_list[1].args[0] == "Scoped second-brain answer."
+    assert "discord:sentinel-dm-target" not in channel.send.await_args_list[0].args[0]
+    assert "discord:sentinel-dm-target" not in channel.send.await_args_list[1].args[0]
+
+
+@pytest.mark.asyncio
 async def test_next_message_pending_flow_does_not_call_opencode_callback_target(monkeypatch):
     adapter = _adapter()
     adapter._set_secondbrain_pending(

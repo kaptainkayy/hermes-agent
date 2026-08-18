@@ -3200,12 +3200,58 @@ class DiscordAdapter(BasePlatformAdapter):
         }
         await interaction.response.send_message(**payload)
 
+    async def _call_factory_plugin(self, args: str) -> str:
+        """Run the factory-control plugin handler and return its answer as text."""
+        from hermes_cli.plugins import get_plugin_commands
+
+        command = get_plugin_commands().get("factory")
+        if not command or not command.get("handler"):
+            return "Factory control is unavailable: the factory-control plugin is not loaded."
+
+        try:
+            result = command["handler"](args)
+            if asyncio.iscoroutine(result):
+                result = await result
+        except Exception as err:
+            logger.warning("Factory control handler failed: %s", err)
+            return "Factory control could not be reached. Please try again."
+
+        return str(result) if result else "Factory control returned nothing."
+
+    async def _handle_factory_slash(self, interaction: "discord.Interaction", args: str = "") -> None:
+        """Answer /factory with buttons, or run a subcommand when one was typed."""
+        if args.strip():
+            await self._run_simple_slash(interaction, f"/factory {args.strip()}")
+            return
+
+        if not await self._check_slash_authorization(interaction, "/factory"):
+            return
+
+        view = FactoryControlView(
+            adapter=self,
+            allowed_user_ids=self._allowed_user_ids,
+            allowed_role_ids=self._allowed_role_ids,
+        )
+        await interaction.response.send_message(
+            content="Software factory — pick one:",
+            view=view,
+            ephemeral=True,
+        )
+
     def _register_slash_commands(self) -> None:
         """Register Discord slash commands on the command tree."""
         if not self._client:
             return
 
         tree = self._client.tree
+
+        @tree.command(
+            name="factory",
+            description="Check the software factory, read its plan, or clear what is blocking it.",
+        )
+        @discord.app_commands.describe(args="Leave empty for buttons, or type: status, plan, unblock")
+        async def slash_factory(interaction: discord.Interaction, args: str = ""):
+            await self._handle_factory_slash(interaction, args)
 
         @tree.command(name="secondbrain", description="Ask a selected Second Brain database")
         async def slash_secondbrain(interaction: discord.Interaction):
@@ -5276,7 +5322,7 @@ def _define_discord_view_classes() -> None:
     lazy install sets DISCORD_AVAILABLE=True but leaves the classes
     undefined, causing NameError on the first button interaction.
     """
-    global ExecApprovalView, SlashConfirmView, UpdatePromptView, ModelPickerView, ClarifyChoiceView, SecondBrainCorpusSelectView
+    global ExecApprovalView, SlashConfirmView, UpdatePromptView, ModelPickerView, ClarifyChoiceView, SecondBrainCorpusSelectView, FactoryControlView
 
     class ExecApprovalView(discord.ui.View):
         """
@@ -5851,6 +5897,89 @@ def _define_discord_view_classes() -> None:
                 content=f"{entry.label} is ready. What would you like to know?",
                 view=self,
             )
+
+    class FactoryControlView(discord.ui.View):
+        """Run the software factory's read and recover commands by tapping.
+
+        A plugin handler can only return a string, so the factory's subcommands are
+        otherwise typed out on a phone keyboard. Each button runs the same plugin
+        handler the slash command does and edits this message with the answer, so
+        one tap replaces one line of typing.
+        """
+
+        def __init__(self, adapter, allowed_user_ids: set, allowed_role_ids: Optional[set] = None):
+            super().__init__(timeout=600)
+            self.adapter = adapter
+            self.allowed_user_ids = allowed_user_ids
+            self.allowed_role_ids = allowed_role_ids or set()
+
+            self._stop_armed = False
+
+            for label, subcommand, style in (
+                ("Status", "status", discord.ButtonStyle.primary),
+                ("Plan", "plan", discord.ButtonStyle.secondary),
+                ("Unblock", "unblock", discord.ButtonStyle.secondary),
+            ):
+                self.add_item(self._make_button(label, subcommand, style))
+
+            self.add_item(
+                self._make_button("Clear STOP", "unblock stop", discord.ButtonStyle.danger, confirm=True)
+            )
+
+        def _make_button(self, label: str, subcommand: str, style, confirm: bool = False) -> "discord.ui.Button":
+            button = discord.ui.Button(
+                label=label,
+                style=style,
+                custom_id=f"factory_{subcommand.replace(' ', '_')}",
+            )
+            if confirm:
+                button.callback = lambda interaction: self._run_stop(interaction, subcommand)
+            else:
+                button.callback = lambda interaction: self._run(interaction, subcommand)
+            return button
+
+        async def _run_stop(self, interaction: "discord.Interaction", subcommand: str) -> None:
+            """Clear a halt a human set, but only when asked twice.
+
+            One tap on a phone is too easy to make by accident for an action whose
+            whole meaning is "I know the factory was stopped on purpose".
+            """
+            if not self._check_auth(interaction):
+                await interaction.response.send_message("You're not authorized~", ephemeral=True)
+                return
+
+            if not self._stop_armed:
+                self._stop_armed = True
+                await interaction.response.defer()
+                await interaction.edit_original_response(
+                    content=(
+                        "STOP was set by hand, so clearing it overrules a deliberate halt. "
+                        "Press Clear STOP again to confirm."
+                    ),
+                    view=self,
+                )
+                return
+
+            self._stop_armed = False
+            await self._run(interaction, subcommand)
+
+        def _check_auth(self, interaction: "discord.Interaction") -> bool:
+            return _component_check_auth(
+                interaction, self.allowed_user_ids, self.allowed_role_ids,
+            )
+
+        async def _run(self, interaction: "discord.Interaction", subcommand: str) -> None:
+            if not self._check_auth(interaction):
+                await interaction.response.send_message("You're not authorized~", ephemeral=True)
+                return
+
+            # The CLI shells out to node, which can outlast Discord's three-second
+            # acknowledgement window on a cold start.
+            await interaction.response.defer()
+
+            answer = await self.adapter._call_factory_plugin(subcommand)
+
+            await interaction.edit_original_response(content=answer, view=self)
 
     class ClarifyChoiceView(discord.ui.View):
         """Interactive button view for the clarify tool's multiple-choice prompts.

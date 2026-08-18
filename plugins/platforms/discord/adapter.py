@@ -3076,6 +3076,29 @@ class DiscordAdapter(BasePlatformAdapter):
     def _clear_secondbrain_pending(self, *, user_id: str, channel_id: str) -> None:
         self._secondbrain_pending.pop(self._secondbrain_context_key(user_id, channel_id), None)
 
+    async def _answer_secondbrain_question(self, *, corpus_key: str, question: str, label: str) -> str:
+        """Run the plugin's retrieval-and-summarize path for one corpus."""
+        plugin_name, answer_api, error = self._get_secondbrain_answer_api()
+        if error is not None:
+            logger.warning("Second Brain answer API unavailable: %s", error)
+            return "Second Brain is unavailable. Please try again in a moment."
+
+        try:
+            context = self._new_secondbrain_context(plugin_name)
+        except Exception:
+            from types import SimpleNamespace
+
+            logger.warning("Second Brain plugin context unavailable for modal question")
+            context = SimpleNamespace(llm=None)
+
+        try:
+            answer = await answer_api(context, question, corpus_key)
+        except Exception:
+            logger.warning("Second Brain answer failed for %s", corpus_key, exc_info=True)
+            return f"Unable to answer from {label} right now. The model or database refused the request."
+
+        return answer or f"No answer came back from {label}."
+
     def _get_secondbrain_browse_api(self):
         """Resolve the plugin's scoped browse function, or say why it is missing."""
         from hermes_cli.plugins import get_plugin_commands
@@ -5341,7 +5364,7 @@ def _define_discord_view_classes() -> None:
     lazy install sets DISCORD_AVAILABLE=True but leaves the classes
     undefined, causing NameError on the first button interaction.
     """
-    global ExecApprovalView, SlashConfirmView, UpdatePromptView, ModelPickerView, ClarifyChoiceView, SecondBrainCorpusSelectView, SecondBrainActionView, FactoryControlView
+    global ExecApprovalView, SlashConfirmView, UpdatePromptView, ModelPickerView, ClarifyChoiceView, SecondBrainCorpusSelectView, SecondBrainActionView, SecondBrainQuestionModal, FactoryControlView
 
     class ExecApprovalView(discord.ui.View):
         """
@@ -5921,6 +5944,48 @@ def _define_discord_view_classes() -> None:
                 ),
             )
 
+    class SecondBrainQuestionModal(discord.ui.Modal):
+        """Type a question for the picked corpus without posting it in the channel.
+
+        The typed path answers whatever you send as a plain message, which is public
+        in a channel and lost as soon as the selection expires. A modal keeps the
+        question and the answer private to the person who asked.
+        """
+
+        MAX_CONTENT_CHARS = 2000
+
+        def __init__(self, adapter, entry):
+            super().__init__(title=f"Ask {entry.label}"[:45], timeout=900)
+            self.adapter = adapter
+            self.entry = entry
+
+            self.question = discord.ui.TextInput(
+                label="Your question",
+                placeholder="What do you want to know?",
+                style=discord.TextStyle.paragraph,
+                max_length=1000,
+                required=True,
+            )
+            self.add_item(self.question)
+
+        def _fit(self, text: str) -> str:
+            if len(text) <= self.MAX_CONTENT_CHARS:
+                return text
+            notice = "\n… truncated."
+            return text[: self.MAX_CONTENT_CHARS - len(notice)] + notice
+
+        async def on_submit(self, interaction: "discord.Interaction") -> None:
+            # Retrieval plus generation takes tens of seconds; deferring buys 15 minutes.
+            await interaction.response.defer(ephemeral=True, thinking=True)
+
+            answer = await self.adapter._answer_secondbrain_question(
+                corpus_key=self.entry.key,
+                question=self.question.value,
+                label=self.entry.label,
+            )
+
+            await interaction.followup.send(self._fit(answer), ephemeral=True)
+
     class SecondBrainActionView(discord.ui.View):
         """Read a corpus the user already picked, without typing a phrase for it.
 
@@ -5939,9 +6004,17 @@ def _define_discord_view_classes() -> None:
             self.allowed_user_ids = allowed_user_ids
             self.allowed_role_ids = allowed_role_ids or set()
 
+            ask = discord.ui.Button(
+                label="Ask",
+                style=discord.ButtonStyle.primary,
+                custom_id="secondbrain_ask",
+            )
+            ask.callback = self._on_ask
+            self.add_item(ask)
+
             recent = discord.ui.Button(
                 label="Recent entries",
-                style=discord.ButtonStyle.primary,
+                style=discord.ButtonStyle.secondary,
                 custom_id="secondbrain_recent_entries",
             )
             recent.callback = self._on_recent_entries
@@ -5965,6 +6038,17 @@ def _define_discord_view_classes() -> None:
                 return text
             notice = "\n… truncated."
             return text[: self.MAX_CONTENT_CHARS - len(notice)] + notice
+
+        async def _on_ask(self, interaction: "discord.Interaction") -> None:
+            if not self._check_auth(interaction):
+                await interaction.response.send_message("You're not authorized~", ephemeral=True)
+                return
+
+            # A modal has to be the first response to the interaction, so this one
+            # cannot defer: the slow work happens after the question is submitted.
+            await interaction.response.send_modal(
+                SecondBrainQuestionModal(adapter=self.adapter, entry=self.entry)
+            )
 
         async def _on_recent_entries(self, interaction: "discord.Interaction") -> None:
             if not self._check_auth(interaction):

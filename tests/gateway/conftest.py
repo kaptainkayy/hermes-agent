@@ -169,12 +169,36 @@ def _ensure_discord_mock() -> None:
             self.description = description
     discord_mod.SelectOption = _FakeSelectOption
 
+    class _FakeModal:
+        def __init__(self, *, title=None, timeout=None, **_):
+            self.title = title
+            self.timeout = timeout
+            self.children = []
+        def add_item(self, item):
+            self.children.append(item)
+
+    class _FakeTextInput:
+        def __init__(self, *, label=None, placeholder=None, style=None,
+                     max_length=None, required=True, default=None, **_):
+            self.label = label
+            self.placeholder = placeholder
+            self.style = style
+            self.max_length = max_length
+            self.required = required
+            self._value = default
+        @property
+        def value(self):
+            return self._value or ""
+
     discord_mod.ui = SimpleNamespace(
         View=_FakeView,
         Select=_FakeSelect,
         Button=_FakeButton,
+        Modal=_FakeModal,
+        TextInput=_FakeTextInput,
         button=lambda *a, **k: (lambda fn: fn),
     )
+    discord_mod.TextStyle = SimpleNamespace(short=1, paragraph=2, long=2)
     discord_mod.ButtonStyle = SimpleNamespace(
         success=1, primary=2, secondary=2, danger=3,
         green=1, grey=2, blurple=2, red=3,

@@ -3073,6 +3073,25 @@ class DiscordAdapter(BasePlatformAdapter):
             "expires_at": time.time() + 600,
         }
 
+    def _clear_secondbrain_pending(self, *, user_id: str, channel_id: str) -> None:
+        self._secondbrain_pending.pop(self._secondbrain_context_key(user_id, channel_id), None)
+
+    def _get_secondbrain_browse_api(self):
+        """Resolve the plugin's scoped browse function, or say why it is missing."""
+        from hermes_cli.plugins import get_plugin_commands
+
+        secondbrain = get_plugin_commands().get("secondbrain")
+        handler = secondbrain.get("handler") if secondbrain else None
+        if handler is None:
+            return None, "Second Brain browsing is unavailable."
+
+        module = sys.modules.get(getattr(handler, "__module__", ""))
+        browse_api = getattr(module, "browse_second_brain_corpus", None) if module else None
+        if not callable(browse_api):
+            return None, "Second Brain browsing is unavailable in this plugin version."
+
+        return browse_api, None
+
     def _get_secondbrain_answer_api(self):
         from hermes_cli.plugins import get_plugin_commands
         commands = get_plugin_commands()
@@ -5322,7 +5341,7 @@ def _define_discord_view_classes() -> None:
     lazy install sets DISCORD_AVAILABLE=True but leaves the classes
     undefined, causing NameError on the first button interaction.
     """
-    global ExecApprovalView, SlashConfirmView, UpdatePromptView, ModelPickerView, ClarifyChoiceView, SecondBrainCorpusSelectView, FactoryControlView
+    global ExecApprovalView, SlashConfirmView, UpdatePromptView, ModelPickerView, ClarifyChoiceView, SecondBrainCorpusSelectView, SecondBrainActionView, FactoryControlView
 
     class ExecApprovalView(discord.ui.View):
         """
@@ -5889,13 +5908,103 @@ def _define_discord_view_classes() -> None:
                 corpus_key=entry.key,
                 label=entry.label,
             )
-            self.resolved = True
-            for child in self.children:
-                child.disabled = True
-
             await interaction.response.edit_message(
-                content=f"{entry.label} is ready. What would you like to know?",
-                view=self,
+                content=(
+                    f"{entry.label} is ready. Send a question as a message, or tap below."
+                ),
+                view=SecondBrainActionView(
+                    adapter=self.adapter,
+                    index=self.index,
+                    entry=entry,
+                    allowed_user_ids=self.allowed_user_ids,
+                    allowed_role_ids=self.allowed_role_ids,
+                ),
+            )
+
+    class SecondBrainActionView(discord.ui.View):
+        """Read a corpus the user already picked, without typing a phrase for it.
+
+        The plugin understands "show entries" and friends, but only if you remember
+        them. These buttons carry the phrase so the phone doesn't have to.
+        """
+
+        # Discord rejects message content past 2000 characters.
+        MAX_CONTENT_CHARS = 2000
+
+        def __init__(self, adapter, index, entry, allowed_user_ids: set, allowed_role_ids: Optional[set] = None):
+            super().__init__(timeout=600)
+            self.adapter = adapter
+            self.index = index
+            self.entry = entry
+            self.allowed_user_ids = allowed_user_ids
+            self.allowed_role_ids = allowed_role_ids or set()
+
+            recent = discord.ui.Button(
+                label="Recent entries",
+                style=discord.ButtonStyle.primary,
+                custom_id="secondbrain_recent_entries",
+            )
+            recent.callback = self._on_recent_entries
+            self.add_item(recent)
+
+            change = discord.ui.Button(
+                label="Change database",
+                style=discord.ButtonStyle.secondary,
+                custom_id="secondbrain_change_database",
+            )
+            change.callback = self._on_change_database
+            self.add_item(change)
+
+        def _check_auth(self, interaction: "discord.Interaction") -> bool:
+            return _component_check_auth(
+                interaction, self.allowed_user_ids, self.allowed_role_ids,
+            )
+
+        def _fit(self, text: str) -> str:
+            if len(text) <= self.MAX_CONTENT_CHARS:
+                return text
+            notice = "\n… truncated."
+            return text[: self.MAX_CONTENT_CHARS - len(notice)] + notice
+
+        async def _on_recent_entries(self, interaction: "discord.Interaction") -> None:
+            if not self._check_auth(interaction):
+                await interaction.response.send_message("You're not authorized~", ephemeral=True)
+                return
+
+            await interaction.response.defer()
+
+            browse_api, error = self.adapter._get_secondbrain_browse_api()
+            if error is not None:
+                logger.warning("Second Brain browse API unavailable: %s", error)
+                await interaction.edit_original_response(content=error, view=self)
+                return
+
+            try:
+                answer = await browse_api(self.entry.key)
+            except Exception:
+                logger.warning("Second Brain browse failed for %s", self.entry.key)
+                answer = f"Unable to browse {self.entry.label} right now."
+
+            await interaction.edit_original_response(content=self._fit(answer), view=self)
+
+        async def _on_change_database(self, interaction: "discord.Interaction") -> None:
+            if not self._check_auth(interaction):
+                await interaction.response.send_message("You're not authorized~", ephemeral=True)
+                return
+
+            await interaction.response.defer()
+            self.adapter._clear_secondbrain_pending(
+                user_id=str(interaction.user.id),
+                channel_id=str(interaction.channel_id),
+            )
+            await interaction.edit_original_response(
+                content="Which database would you like to have a second brain question for?",
+                view=SecondBrainCorpusSelectView(
+                    adapter=self.adapter,
+                    index=self.index,
+                    allowed_user_ids=self.allowed_user_ids,
+                    allowed_role_ids=self.allowed_role_ids,
+                ),
             )
 
     class FactoryControlView(discord.ui.View):

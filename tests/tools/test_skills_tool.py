@@ -1267,3 +1267,22 @@ class TestSkillViewCollisionDetection:
         result = json.loads(raw)
         assert result["success"] is True
         assert "LOCAL BODY" in result["content"]
+
+    def test_supporting_template_does_not_collide_with_skill_name(self, tmp_path):
+        """A linked template named spotify.md is not a standalone skill."""
+        local_dir = tmp_path / "local"
+        local_dir.mkdir()
+
+        _make_skill(local_dir, "spotify", category="media", body="REAL SPOTIFY SKILL")
+        design_skill = _make_skill(local_dir, "popular-web-designs", category="creative")
+        templates_dir = design_skill / "templates"
+        templates_dir.mkdir()
+        (templates_dir / "spotify.md").write_text("# Spotify design template\n")
+
+        p1, p2 = self._patch_dirs(local_dir, [])
+        with p1, p2:
+            raw = skill_view("spotify")
+
+        result = json.loads(raw)
+        assert result["success"] is True
+        assert "REAL SPOTIFY SKILL" in result["content"]

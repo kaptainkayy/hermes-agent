@@ -352,6 +352,7 @@ def run_conversation(
     agent._invalid_tool_retries = 0
     agent._invalid_json_retries = 0
     agent._empty_content_retries = 0
+    agent._cache_bust_token = 0
     agent._incomplete_scratchpad_retries = 0
     agent._codex_incomplete_retries = 0
     agent._thinking_prefill_retries = 0
@@ -3791,10 +3792,12 @@ def run_conversation(
                     )
                     if _truly_empty and (not _has_structured or _prefill_exhausted) and agent._empty_content_retries < 3:
                         agent._empty_content_retries += 1
+                        agent._cache_bust_token += 1  # Invalidate cached responses on retry
                         logger.warning(
                             "Empty response (no content or reasoning) — "
-                            "retry %d/3 (model=%s)",
+                            "retry %d/3 (model=%s) cache_bust=%d",
                             agent._empty_content_retries, agent.model,
+                            agent._cache_bust_token,
                         )
                         agent._emit_status(
                             f"⚠️ Empty response from model — retrying "

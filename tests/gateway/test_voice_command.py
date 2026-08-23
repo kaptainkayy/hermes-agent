@@ -747,7 +747,8 @@ class TestVoiceChannelCommands:
     _handle_voice_channel_input on the GatewayRunner."""
 
     @pytest.fixture
-    def runner(self, tmp_path):
+    def runner(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_DISCORD_VOICE_WAKE_ENABLED", "false")
         return _make_runner(tmp_path)
 
     def _make_discord_event(self, text="/voice channel", chat_id="123",
@@ -888,17 +889,71 @@ class TestVoiceChannelCommands:
 
     @pytest.mark.asyncio
     async def test_leave_success(self, runner):
-        """Successful leave disconnects and clears voice mode."""
+        """Successful leave disconnects and clears voice callbacks,
+        but preserves voice mode — text replies stay available."""
         mock_adapter = AsyncMock()
         mock_adapter.is_in_voice_channel = MagicMock(return_value=True)
         mock_adapter.leave_voice_channel = AsyncMock()
+        mock_adapter._voice_input_callback = None
         event = self._make_discord_event("/voice leave")
         runner.adapters[event.source.platform] = mock_adapter
         runner._voice_mode["discord:123"] = "all"
         result = await runner._handle_voice_channel_leave(event)
         assert "left" in result.lower()
-        assert runner._voice_mode["discord:123"] == "off"
+        # Voice mode must be preserved after leave (not reset to "off")
+        assert runner._voice_mode["discord:123"] == "all"
         mock_adapter.leave_voice_channel.assert_called_once_with(111)
+
+    @pytest.mark.asyncio
+    async def test_leave_clears_input_callback(self, runner):
+        """Successful leave clears _voice_input_callback."""
+        mock_adapter = AsyncMock()
+        mock_adapter.is_in_voice_channel = MagicMock(return_value=True)
+        mock_adapter.leave_voice_channel = AsyncMock()
+        mock_adapter._voice_input_callback = lambda x: x
+        event = self._make_discord_event("/voice leave")
+        runner.adapters[event.source.platform] = mock_adapter
+        runner._voice_mode["discord:123"] = "all"
+        await runner._handle_voice_channel_leave(event)
+        assert mock_adapter._voice_input_callback is None
+
+    # -- _handle_voice_timeout_cleanup --
+
+    def test_timeout_cleanup_preserves_voice_mode(self, runner):
+        """Timeout cleanup must NOT set voice_mode to off."""
+        from gateway.config import Platform
+        runner._voice_mode["discord:123"] = "all"
+        runner._voice_mode["telegram:123"] = "voice_only"  # same chat_id, different platform
+        runner._handle_voice_timeout_cleanup("123")
+        # Discord voice mode must be preserved
+        assert runner._voice_mode.get("discord:123") == "all"
+        # Telegram voice mode must be untouched
+        assert runner._voice_mode.get("telegram:123") == "voice_only"
+
+    def test_timeout_cleanup_does_not_disable_adapter_auto_tts(self, runner):
+        """Timeout cleanup must NOT call _set_adapter_auto_tts_disabled."""
+        from gateway.config import Platform
+        mock_adapter = AsyncMock()
+        runner.adapters[Platform.DISCORD] = mock_adapter
+        runner._voice_mode["discord:123"] = "all"
+        with patch.object(runner, "_set_adapter_auto_tts_disabled") as mock_disable:
+            runner._handle_voice_timeout_cleanup("123")
+            mock_disable.assert_not_called()
+
+    # -- Explicit /voice off still works (regression guard) --
+
+    @pytest.mark.asyncio
+    async def test_voice_off_still_disables_adapter_auto_tts(self, runner):
+        """Explicit /voice off must still set mode to off and disable adapter auto-TTS."""
+        event = _make_event("/voice off")
+        mock_adapter = AsyncMock()
+        mock_adapter._auto_tts_disabled_chats = set()
+        runner.adapters[event.source.platform] = mock_adapter
+        runner._voice_mode["telegram:123"] = "all"
+        result = await runner._handle_voice_command(event)
+        assert "disabled" in result.lower()
+        assert runner._voice_mode["telegram:123"] == "off"
+        assert "123" in mock_adapter._auto_tts_disabled_chats
 
     # -- _handle_voice_channel_input --
 
@@ -988,6 +1043,72 @@ class TestVoiceChannelCommands:
         msg = mock_channel.send.call_args[0][0]
         assert "Test transcript" in msg
         assert "42" in msg  # user_id in mention
+
+    @pytest.mark.asyncio
+    async def test_input_requires_wake_phrase_when_enabled(self, runner, monkeypatch):
+        """Live voice ignores ambient speech unless addressed with hey <agent>."""
+        from gateway.config import Platform
+
+        monkeypatch.setenv("HERMES_DISCORD_VOICE_WAKE_ENABLED", "true")
+        monkeypatch.setenv("HERMES_DISCORD_VOICE_WAKE_NAME", "Persephone")
+        mock_adapter = AsyncMock()
+        mock_adapter._voice_text_channels = {111: 123}
+        mock_adapter._voice_sources = {}
+        mock_channel = AsyncMock()
+        mock_adapter._client = MagicMock()
+        mock_adapter._client.get_channel = MagicMock(return_value=mock_channel)
+        mock_adapter.handle_message = AsyncMock()
+        runner.adapters[Platform.DISCORD] = mock_adapter
+
+        await runner._handle_voice_channel_input(111, 42, "What's the status?")
+
+        mock_adapter.handle_message.assert_not_called()
+        mock_channel.send.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_input_strips_wake_phrase_before_dispatch(self, runner, monkeypatch):
+        """Wake-addressed voice dispatches only the command text."""
+        from gateway.config import Platform
+
+        monkeypatch.setenv("HERMES_DISCORD_VOICE_WAKE_ENABLED", "true")
+        monkeypatch.setenv("HERMES_DISCORD_VOICE_WAKE_NAME", "Persephone")
+        mock_adapter = AsyncMock()
+        mock_adapter._voice_text_channels = {111: 123}
+        mock_adapter._voice_sources = {}
+        mock_channel = AsyncMock()
+        mock_adapter._client = MagicMock()
+        mock_adapter._client.get_channel = MagicMock(return_value=mock_channel)
+        mock_adapter.handle_message = AsyncMock()
+        runner.adapters[Platform.DISCORD] = mock_adapter
+
+        await runner._handle_voice_channel_input(111, 42, "Hey Persephone, what's the status?")
+
+        mock_adapter.handle_message.assert_called_once()
+        event = mock_adapter.handle_message.call_args[0][0]
+        assert event.text == "what's the status?"
+        mock_channel.send.assert_called_once()
+        assert "Hey Persephone" not in mock_channel.send.call_args[0][0]
+
+    @pytest.mark.asyncio
+    async def test_input_wake_gate_can_be_disabled(self, runner, monkeypatch):
+        """Env override keeps old always-listening behavior when needed."""
+        from gateway.config import Platform
+
+        monkeypatch.setenv("HERMES_DISCORD_VOICE_WAKE_ENABLED", "false")
+        mock_adapter = AsyncMock()
+        mock_adapter._voice_text_channels = {111: 123}
+        mock_adapter._voice_sources = {}
+        mock_channel = AsyncMock()
+        mock_adapter._client = MagicMock()
+        mock_adapter._client.get_channel = MagicMock(return_value=mock_channel)
+        mock_adapter.handle_message = AsyncMock()
+        runner.adapters[Platform.DISCORD] = mock_adapter
+
+        await runner._handle_voice_channel_input(111, 42, "What's the status?")
+
+        mock_adapter.handle_message.assert_called_once()
+        event = mock_adapter.handle_message.call_args[0][0]
+        assert event.text == "What's the status?"
 
     @pytest.mark.asyncio
     async def test_input_suppresses_duplicate_transcript(self, runner):
@@ -1422,15 +1543,19 @@ class TestCallbackWiringOrder:
 # =====================================================================
 
 class TestLeaveExceptionHandling:
-    """Verify state is cleaned up even when leave_voice_channel raises."""
+    """Verify callbacks are cleaned up even when leave_voice_channel raises.
+
+    Voice mode is no longer modified on leave — only callbacks are cleared.
+    """
 
     @pytest.fixture
     def runner(self, tmp_path):
         return _make_runner(tmp_path)
 
     @pytest.mark.asyncio
-    async def test_leave_exception_still_cleans_state(self, runner):
-        """If leave_voice_channel raises, voice_mode is still cleaned up."""
+    async def test_leave_exception_clears_callbacks_preserves_mode(self, runner):
+        """If leave_voice_channel raises, voice callbacks are cleared
+        but voice_mode is preserved."""
         mock_adapter = AsyncMock()
         mock_adapter.is_in_voice_channel = MagicMock(return_value=True)
         mock_adapter.leave_voice_channel = AsyncMock(
@@ -1445,7 +1570,8 @@ class TestLeaveExceptionHandling:
 
         result = await runner._handle_voice_channel_leave(event)
         assert "left" in result.lower()
-        assert runner._voice_mode["telegram:123"] == "off"
+        # Voice mode must be preserved after leave exception
+        assert runner._voice_mode["telegram:123"] == "all"
         assert mock_adapter._voice_input_callback is None
 
     @pytest.mark.asyncio
@@ -1845,7 +1971,7 @@ class TestSendVoiceReplyFilename:
 # =====================================================================
 
 class TestVoiceTimeoutCleansRunnerState:
-    """Timeout disconnect notifies runner to clean voice_mode."""
+    """Timeout disconnect notifies runner — voice_mode stays untouched."""
 
     @staticmethod
     def _make_discord_adapter():
@@ -1903,15 +2029,15 @@ class TestVoiceTimeoutCleansRunnerState:
             "_on_voice_disconnect must be called with chat_id on timeout"
 
     @pytest.mark.asyncio
-    async def test_runner_cleanup_method_removes_voice_mode(self, tmp_path):
-        """_handle_voice_timeout_cleanup removes voice_mode for chat."""
+    async def test_runner_cleanup_preserves_voice_mode(self, tmp_path):
+        """_handle_voice_timeout_cleanup preserves existing voice_mode for chat."""
         runner = _make_runner(tmp_path)
         runner._voice_mode["discord:999"] = "all"
 
         runner._handle_voice_timeout_cleanup("999")
 
-        assert runner._voice_mode["discord:999"] == "off", \
-            "voice_mode must persist explicit off state after timeout cleanup"
+        assert runner._voice_mode["discord:999"] == "all", \
+            "voice_mode must be preserved after timeout cleanup"
 
     @pytest.mark.asyncio
     async def test_timeout_without_callback_does_not_crash(self, adapter):
@@ -2828,6 +2954,64 @@ class TestUDPKeepalive:
             mock_conn.send_packet.assert_called_with(b'\xf8\xff\xfe')
         finally:
             DiscordAdapter._KEEPALIVE_INTERVAL = original_interval
+
+    @pytest.mark.asyncio
+    async def test_barge_in_enabled_processes_speech_during_playback(self, monkeypatch):
+        """With barge-in on, completed speech during TTS must not be dropped."""
+        from plugins.platforms.discord.adapter import DiscordAdapter, VoiceReceiver
+
+        monkeypatch.setenv("HERMES_DISCORD_VOICE_BARGE_IN", "true")
+        adapter = object.__new__(DiscordAdapter)
+        adapter._client = SimpleNamespace(get_guild=lambda _guild_id: None)
+        adapter._voice_receivers = {}
+        adapter._voice_clients = {}
+        adapter._is_allowed_user = MagicMock(return_value=True)
+        adapter._process_voice_input = AsyncMock()
+
+        pcm = b"\0" * (VoiceReceiver.SAMPLE_RATE * VoiceReceiver.CHANNELS * 2)
+        receiver = SimpleNamespace(
+            _running=True,
+            _barge_in_triggered=False,
+            check_silence=MagicMock(side_effect=lambda: setattr(receiver, "_running", False) or [(123, pcm)]),
+        )
+        vc = MagicMock()
+        vc.is_connected.return_value = True
+        vc.is_playing.return_value = True
+        adapter._voice_receivers[111] = receiver
+        adapter._voice_clients[111] = vc
+
+        await adapter._voice_listen_loop(111)
+
+        adapter._process_voice_input.assert_awaited_once_with(111, 123, pcm)
+
+    @pytest.mark.asyncio
+    async def test_barge_in_disabled_ignores_speech_during_playback(self, monkeypatch):
+        """With barge-in off, preserve the old no-capture-during-TTS behavior."""
+        from plugins.platforms.discord.adapter import DiscordAdapter, VoiceReceiver
+
+        monkeypatch.setenv("HERMES_DISCORD_VOICE_BARGE_IN", "false")
+        adapter = object.__new__(DiscordAdapter)
+        adapter._client = SimpleNamespace(get_guild=lambda _guild_id: None)
+        adapter._voice_receivers = {}
+        adapter._voice_clients = {}
+        adapter._is_allowed_user = MagicMock(return_value=True)
+        adapter._process_voice_input = AsyncMock()
+
+        pcm = b"\0" * (VoiceReceiver.SAMPLE_RATE * VoiceReceiver.CHANNELS * 2)
+        receiver = SimpleNamespace(
+            _running=True,
+            _barge_in_triggered=False,
+            check_silence=MagicMock(side_effect=lambda: setattr(receiver, "_running", False) or [(123, pcm)]),
+        )
+        vc = MagicMock()
+        vc.is_connected.return_value = True
+        vc.is_playing.return_value = True
+        adapter._voice_receivers[111] = receiver
+        adapter._voice_clients[111] = vc
+
+        await adapter._voice_listen_loop(111)
+
+        adapter._process_voice_input.assert_not_awaited()
 
 
 # =====================================================================

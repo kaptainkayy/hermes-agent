@@ -623,9 +623,24 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
     # Strip image parts for non-vision models (no-op when vision-capable).
     _msgs_for_chat = agent._prepare_messages_for_non_vision_model(api_messages)
 
+    # ── Cache-bust token for empty-response retry ─────────────────
+    # When OpenRouter caches an empty (thinking-only) response, every
+    # retry with the same payload returns the same cached empty.  By
+    # including a monotonically increasing token in extra_body we
+    # force a different cache key, so the retry actually re-queries
+    # the upstream model.
+    _extra_body_additions: dict | None = None
+    _cache_bust = getattr(agent, "_cache_bust_token", 0)
+    if _cache_bust > 0:
+        import time as _time
+        _extra_body_additions = {
+            "_hermes_cache_bust": f"retry-{_cache_bust}-{_time.monotonic_ns()}",
+        }
+
     return _ct.build_kwargs(
         model=agent.model,
         messages=_msgs_for_chat,
+        extra_body_additions=_extra_body_additions,
         tools=tools_for_api,
         base_url=agent.base_url,
         timeout=agent._resolved_api_call_timeout(),

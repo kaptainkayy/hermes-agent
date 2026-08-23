@@ -49,7 +49,7 @@ import tempfile
 import threading
 import uuid
 from pathlib import Path
-from typing import Callable, Dict, Any, Optional
+from typing import Callable, Dict, Any, Iterable, Optional
 from urllib.parse import urljoin
 
 from hermes_constants import display_hermes_home
@@ -193,6 +193,7 @@ DEFAULT_OUTPUT_DIR = _get_default_output_dir()
 PROVIDER_MAX_TEXT_LENGTH: Dict[str, int] = {
     "edge": 5000,         # edge-tts practical sync limit
     "openai": 4096,       # https://platform.openai.com/docs/guides/text-to-speech
+    "orpheus": 4096,      # live voice streaming TTS
     "xai": 15000,         # https://docs.x.ai/developers/model-capabilities/audio/text-to-speech
     "minimax": 10000,     # https://platform.minimax.io/docs/api-reference/speech-t2a-http (sync)
     "mistral": 4000,      # conservative; no published per-request cap
@@ -301,8 +302,37 @@ def _load_tts_config() -> Dict[str, Any]:
 
 
 def _get_provider(tts_config: Dict[str, Any]) -> str:
-    """Get the configured TTS provider name."""
+    """Get the configured TTS provider name.
+
+    ``HERMES_TTS_PROVIDER_OVERRIDE`` is an internal, scoped override used by
+    low-latency voice pipelines while synthesizing a single chunk.  Public
+    Discord-specific env vars are intentionally handled by the gateway, not
+    globally here, so setting ``HERMES_DISCORD_VOICE_TTS_PROVIDER`` cannot
+    accidentally switch Telegram/async TTS away from the user's configured
+    provider.
+    """
+    override = os.getenv("HERMES_TTS_PROVIDER_OVERRIDE")
+    if override:
+        return override.lower().strip()
     return (tts_config.get("provider") or DEFAULT_PROVIDER).lower().strip()
+
+
+def _get_forbidden_providers() -> set[str]:
+    """Return TTS provider names denied for this process/profile.
+
+    This is a profile isolation guard for A/B bots so stale config or scoped
+    overrides cannot route synthesis through explicitly blocked providers.
+    """
+    raw = os.getenv("HERMES_FORBID_TTS_PROVIDERS", "")
+    return {
+        item.strip().lower()
+        for item in raw.replace(";", ",").split(",")
+        if item.strip()
+    }
+
+
+def _is_provider_forbidden(provider: str) -> bool:
+    return provider.lower().strip() in _get_forbidden_providers()
 
 
 # ===========================================================================
@@ -310,8 +340,8 @@ def _get_provider(tts_config: Dict[str, Any]) -> str:
 # ===========================================================================
 #
 # Users can declare any number of command-type providers alongside the
-# built-ins so they can plug any local CLI (Piper, VoxCPM, Kokoro CLIs,
-# custom voice-cloning scripts, etc.) into Hermes without any Python code
+# built-ins so they can plug any local CLI (Piper, VoxCPM, custom
+# voice-cloning scripts, etc.) into Hermes without any Python code
 # changes. The config shape is::
 #
 #     tts:
@@ -340,6 +370,7 @@ BUILTIN_TTS_PROVIDERS = frozenset({
     "edge",
     "elevenlabs",
     "openai",
+    "orpheus",
     "minimax",
     "xai",
     "mistral",
@@ -417,123 +448,6 @@ def _resolve_command_provider_config(
     if _is_command_provider_config(config):
         return config
     return None
-
-
-def _dispatch_to_plugin_provider(
-    text: str,
-    output_path: str,
-    provider: str,
-    tts_config: Dict[str, Any],
-) -> Optional[str]:
-    """Route the call to a plugin-registered TTS provider, or return None.
-
-    Returns the path to the written audio file on dispatch, or ``None``
-    to fall through to the next resolution layer (built-in dispatch or
-    Edge TTS default).
-
-    Resolution invariants enforced here (matches issue #30398):
-
-    1. Built-in provider names short-circuit — never reach the plugin
-       registry. The caller is responsible for the elif chain that
-       handles ``edge``/``openai``/etc.; this function explicitly
-       rejects those names defensively.
-    2. Command-type providers declared under
-       ``tts.providers.<name>: type: command`` (PR #17843) win over a
-       plugin with the same name. The caller passes us only when its
-       own command-provider check returned None — we re-verify here so
-       a refactor of the caller can't silently break the invariant.
-    3. Plugin dispatch fires only when ``provider`` matches a registered
-       :class:`TTSProvider` whose ``name`` equals the configured value.
-       Unknown names return None (caller falls through to Edge default).
-
-    Plugin exceptions are caught and re-raised — the outer
-    ``text_to_speech_tool`` try/except converts them to the standard
-    error envelope, matching how command-provider failures surface.
-    """
-    if not provider:
-        return None
-    key = provider.lower().strip()
-    if key in BUILTIN_TTS_PROVIDERS:
-        return None
-    # Defense in depth: command-provider check should already have
-    # short-circuited the caller. If a same-name command config exists,
-    # bail so the command path wins.
-    if _is_command_provider_config(_get_named_provider_config(tts_config, key)):
-        return None
-    try:
-        from agent.tts_registry import get_provider
-        from hermes_cli.plugins import _ensure_plugins_discovered
-
-        _ensure_plugins_discovered()
-        plugin_provider = get_provider(key)
-        if plugin_provider is None:
-            # Long-lived sessions may have discovered plugins before the
-            # bundled backend was patched in or before config changed.
-            # Retry once with a forced refresh before surfacing fall-
-            # through. Mirrors the image_gen / browser dispatcher
-            # recovery pattern.
-            _ensure_plugins_discovered(force=True)
-            plugin_provider = get_provider(key)
-    except Exception as exc:  # noqa: BLE001 — discovery failure is non-fatal
-        logger.debug("tts plugin dispatch skipped (discovery failed): %s", exc)
-        return None
-    if plugin_provider is None:
-        return None
-
-    # Resolve voice / model / format from tts_config — providers should
-    # treat all of these as optional and fall back to their own defaults
-    # when None is passed (matches the ABC contract documented on
-    # ``TTSProvider.synthesize``).
-    voice = tts_config.get("voice") if isinstance(tts_config, dict) else None
-    model = tts_config.get("model") if isinstance(tts_config, dict) else None
-    speed = tts_config.get("speed") if isinstance(tts_config, dict) else None
-    fmt = (
-        tts_config.get("output_format", DEFAULT_COMMAND_TTS_OUTPUT_FORMAT)
-        if isinstance(tts_config, dict)
-        else DEFAULT_COMMAND_TTS_OUTPUT_FORMAT
-    )
-
-    logger.info(
-        "Generating speech with plugin TTS provider '%s'...", key,
-    )
-    written = plugin_provider.synthesize(
-        text,
-        output_path,
-        voice=voice if isinstance(voice, str) and voice else None,
-        model=model if isinstance(model, str) and model else None,
-        speed=float(speed) if isinstance(speed, (int, float)) else None,
-        format=str(fmt).lower() if fmt else "mp3",
-    )
-    # Provider contract: returns the (possibly rewritten) output path.
-    # Defensive against a provider returning None or a non-string —
-    # fall back to the caller's expected output_path.
-    return written if isinstance(written, str) and written else output_path
-
-
-def _plugin_provider_is_voice_compatible(provider: str) -> bool:
-    """Return True when the registered plugin provider opts into voice
-    bubble delivery via its ``voice_compatible`` property.
-
-    Defensive: any registry or property access failure means False
-    (matches the safe default for the command-provider path).
-    """
-    if not provider:
-        return False
-    key = provider.lower().strip()
-    if key in BUILTIN_TTS_PROVIDERS:
-        return False
-    try:
-        from agent.tts_registry import get_provider
-
-        plugin_provider = get_provider(key)
-        if plugin_provider is None:
-            return False
-        return bool(plugin_provider.voice_compatible)
-    except Exception as exc:  # noqa: BLE001
-        logger.debug(
-            "tts plugin voice_compatible check failed for '%s': %s", key, exc,
-        )
-        return False
 
 
 def _iter_command_providers(tts_config: Dict[str, Any]):
@@ -957,6 +871,329 @@ def _generate_elevenlabs(text: str, output_path: str, tts_config: Dict[str, Any]
 
 
 # ===========================================================================
+# Provider: Orpheus TTS
+# ===========================================================================
+
+# Default Orpheus voice candidates for profile mapping.
+# These are the built-in English voices from the Orpheus TTS backend.
+_ORPHEUS_KNOWN_VOICES = frozenset({
+    "tara", "leah", "jess", "leo", "dan", "mia", "zac", "zoe", "julia",
+})
+
+
+# ---------------------------------------------------------------------------
+# Orpheus repetition_penalty plumbing
+# ---------------------------------------------------------------------------
+
+def _get_orpheus_repetition_penalty(tts_config: Dict[str, Any]) -> Optional[float]:
+    """Return a clamped repetition_penalty (1.0..2.0) for Orpheus requests.
+
+    Resolution order:
+      1. ``HERMES_ORPHEUS_REPETITION_PENALTY`` env var (overrides config)
+      2. ``tts.orpheus.repetition_penalty`` from config
+
+    Returns ``None`` when neither source is set (don't send the field).
+    Clamps to [1.0, 2.0]. Invalid/non-float values log a warning and return
+    ``None`` so the request is sent without the field.
+    """
+    # Allow tests to override get_env_value
+    env_raw = get_env_value("HERMES_ORPHEUS_REPETITION_PENALTY")
+    raw = None
+    source = None  # "env" or "config"
+
+    if env_raw is not None and env_raw.strip():
+        raw = env_raw.strip()
+        source = "env"
+    else:
+        orpheus_config = tts_config.get("orpheus", {}) if isinstance(tts_config, dict) else {}
+        cfg_val = orpheus_config.get("repetition_penalty")
+        if cfg_val is not None:
+            raw = cfg_val
+            source = "config"
+
+    if raw is None:
+        return None
+
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "Invalid %s value for Orpheus repetition_penalty: %r — ignoring",
+            source or "unknown", raw,
+        )
+        return None
+
+    if value < 1.0:
+        logger.info(
+            "Clamping Orpheus repetition_penalty from %s (from %s) to 1.0",
+            value, source or "unknown",
+        )
+        value = 1.0
+    elif value > 2.0:
+        logger.info(
+            "Clamping Orpheus repetition_penalty from %s (from %s) to 2.0",
+            value, source or "unknown",
+        )
+        value = 2.0
+
+    return value
+
+
+def _looks_like_structured_or_numeric_speech(text: str) -> bool:
+    """Return True for text where emotive prefixes hurt clarity.
+
+    Counts, digit lists, and long comma-separated recitations need literal,
+    stable pronunciation more than warmth.  Do not add chuckle/sigh style tags
+    to those chunks.
+    """
+    cleaned = str(text or "").strip()
+    if not cleaned:
+        return True
+    words = re.findall(r"\b[\w'-]+\b", cleaned.lower())
+    if not words:
+        return True
+    number_words = {
+        "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
+        "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen",
+        "seventeen", "eighteen", "nineteen", "twenty", "thirty", "forty", "fifty",
+        "sixty", "seventy", "eighty", "ninety", "hundred", "thousand",
+    }
+    numeric_count = sum(1 for word in words if word.isdigit() or word in number_words)
+    if numeric_count >= 3 and numeric_count / max(len(words), 1) >= 0.75:
+        return True
+    if cleaned.count(",") >= 4 and len(words) <= 30:
+        return True
+    return False
+
+
+def _orpheus_style_prefix(tts_config: Dict[str, Any]) -> str:
+    """Return an optional per-chunk Orpheus prosody prefix.
+
+    Orpheus chunks are separate generations, so prosody resets between chunks.
+    A short non-verbal style tag can gently re-anchor each conversational chunk
+    without adding temperature/top_p sampling controls.
+    """
+    env_prefix = get_env_value("HERMES_ORPHEUS_STYLE_PREFIX")
+    if env_prefix is not None:
+        return env_prefix.strip()
+
+    orpheus_config = tts_config.get("orpheus", {}) if isinstance(tts_config, dict) else {}
+    configured = orpheus_config.get("style_prefix")
+    if configured is not None:
+        return str(configured).strip()
+
+    return ""
+
+
+def _apply_orpheus_style_prefix(text: str, tts_config: Dict[str, Any]) -> str:
+    """Apply a stable style prefix to conversational Orpheus chunks."""
+    raw = str(text or "").strip()
+    prefix = _orpheus_style_prefix(tts_config)
+    if not raw or not prefix:
+        return raw
+    if raw.startswith("<") or _looks_like_structured_or_numeric_speech(raw):
+        return raw
+    return f"{prefix} {raw}".strip()
+
+
+def _resolve_orpheus_profile_voice(
+    requested_voice: str,
+    text: str = "",
+    profile_path: str = "",
+) -> tuple:
+    """Resolve an Orpheus voice through profile routing with opt-in keywords.
+
+    Args:
+        requested_voice: The voice from config (``"auto"`` for profile routing,
+            or an explicit voice name like ``"tara"`` or ``"leah"``).
+        text: The full input text (used for keyword-based routing rules).
+        profile_path: Path to an Orpheus voice profile YAML file.
+            Falls back to ``ORPHEUS_VOICE_PROFILES`` env var, then to ``tara``.
+
+    Returns:
+        Tuple of ``(resolved_voice, route_label)`` where ``route_label``
+        describes the resolution path (``"explicit"``, ``"default"``,
+        ``"profile:<name>"``, or ``"error:<msg>"``).
+
+    The profile YAML follows this structure:
+
+    .. code-block:: yaml
+
+        default_voice: tara
+        fallback_profile: default
+        profiles:
+          default:
+            voice: tara
+            aliases: [favorite, default, tara]
+          calm:
+            voice: leah
+            aliases: [soothing, soothe]
+        routing_rules:
+          - profile: calm
+            keywords: [use calm voice, calm voice]
+
+    The resolver only activates on ``requested_voice == "auto"``.  Explicit
+    voice names pass through unchanged.  Routing is opt-in: keywords must
+    appear verbatim in ``text``; the profile never switches based on text
+    sentiment alone.
+    """
+    # Explicit voice names pass through unchanged
+    if requested_voice and requested_voice.lower() != "auto":
+        return requested_voice, "explicit"
+
+    # Load profile from provided path, env var, or skip to default
+    if not profile_path:
+        profile_path = os.environ.get("ORPHEUS_VOICE_PROFILES", "")
+
+    if not profile_path or not os.path.isfile(profile_path):
+        logger.debug(
+            "Orpheus voice profile not found at %r; using default voice tara",
+            profile_path or "(no path configured)",
+        )
+        return "tara", "default"
+
+    try:
+        import yaml
+        with open(profile_path, "r", encoding="utf-8") as f:
+            profiles_data = yaml.safe_load(f)
+    except Exception as exc:
+        logger.warning("Failed to load Orpheus voice profile %r: %s", profile_path, exc)
+        return "tara", f"error:{exc}"
+
+    if not isinstance(profiles_data, dict):
+        return "tara", "default"
+
+    default_voice = profiles_data.get("default_voice", "tara")
+    routing_rules = profiles_data.get("routing_rules", [])
+
+    # Check keyword-based routing rules
+    text_lower = text.lower()
+    for rule in routing_rules:
+        profile_name = rule.get("profile", "")
+        keywords = rule.get("keywords", [])
+        for keyword in keywords:
+            if keyword.lower() in text_lower:
+                profile = profiles_data.get("profiles", {}).get(profile_name, {})
+                voice = profile.get("voice", default_voice)
+                logger.info(
+                    "orpheus_voice_route=profile:%s voice=%s keyword=%r",
+                    profile_name, voice, keyword,
+                )
+                return voice, f"profile:{profile_name}"
+
+    # Fallback to default profile
+    fallback_name = profiles_data.get("fallback_profile", "default")
+    fb_profile = profiles_data.get("profiles", {}).get(fallback_name, {})
+    voice = fb_profile.get("voice", default_voice)
+    return voice, "default"
+
+
+def iter_orpheus_pcm_chunks(
+    text: str,
+    tts_config: Optional[Dict[str, Any]] = None,
+    *,
+    chunk_size: int = 4096,
+) -> Iterable[bytes]:
+    """Yield raw 24 kHz mono s16le PCM chunks from Orpheus' streaming endpoint."""
+    import requests
+
+    if tts_config is None:
+        tts_config = _load_tts_config()
+    orpheus_config = tts_config.get("orpheus", {}) if isinstance(tts_config, dict) else {}
+    synthesis_text = _apply_orpheus_style_prefix(text, tts_config)
+    base_url = orpheus_config.get("base_url", "http://localhost:5005/v1")
+    api_key = orpheus_config.get("api_key", "not-needed")
+    model = orpheus_config.get("model", "not-needed")
+    raw_voice = orpheus_config.get("voice", "tara")
+    speed = float(orpheus_config.get("speed", tts_config.get("speed", 1.0)))
+    raw_max_tokens = orpheus_config.get("max_tokens")
+    voice, route_label = _resolve_orpheus_profile_voice(raw_voice, text)
+    logger.info("orpheus_voice_route=%s voice=%s mode=pcm_stream", route_label, voice)
+
+    endpoint = urljoin(base_url.rstrip("/") + "/", "audio/speech_stream")
+    payload: Dict[str, Any] = {
+        "model": model,
+        "voice": voice,
+        "input": synthesis_text,
+    }
+    if speed != 1.0:
+        payload["speed"] = max(0.25, min(4.0, speed))
+    if isinstance(raw_max_tokens, int) and raw_max_tokens > 0:
+        payload["max_tokens"] = raw_max_tokens
+    repetition_penalty = _get_orpheus_repetition_penalty(tts_config)
+    if repetition_penalty is not None:
+        payload["repetition_penalty"] = repetition_penalty
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "x-idempotency-key": str(uuid.uuid4()),
+    }
+
+    with requests.post(endpoint, json=payload, headers=headers, timeout=120, stream=True) as response:
+        response.raise_for_status()
+        for chunk in response.iter_content(chunk_size=chunk_size):
+            if chunk:
+                yield chunk
+
+
+def _generate_orpheus_tts(text: str, output_path: str, tts_config: Dict[str, Any]) -> str:
+    """
+    Generate audio using Orpheus TTS (OpenAI compatible).
+
+    Args:
+        text: Text to convert.
+        output_path: Where to save the audio file.
+        tts_config: TTS config dict.
+
+    Returns:
+        Path to the saved audio file.
+    """
+    orpheus_config = tts_config.get("orpheus", {})
+    synthesis_text = _apply_orpheus_style_prefix(text, tts_config)
+    base_url = orpheus_config.get("base_url", "http://localhost:5005/v1")
+    api_key = orpheus_config.get("api_key", "not-needed")
+    model = orpheus_config.get("model", "not-needed")
+    raw_voice = orpheus_config.get("voice", "tara")
+    speed = float(orpheus_config.get("speed", tts_config.get("speed", 1.0)))
+
+    # Resolve voice through profile routing when voice is "auto"
+    voice, route_label = _resolve_orpheus_profile_voice(raw_voice, text)
+    logger.info("orpheus_voice_route=%s voice=%s", route_label, voice)
+
+    # Determine response format from extension
+    if output_path.endswith(".wav"):
+        response_format = "wav"
+    elif output_path.endswith(".ogg"):
+        response_format = "opus"
+    else:
+        response_format = "mp3"
+
+    OpenAIClient = _import_openai_client()
+    client = OpenAIClient(api_key=api_key, base_url=base_url)
+    try:
+        create_kwargs = {
+            "model": model,
+            "voice": voice,
+            "input": synthesis_text,
+            "response_format": response_format,
+            "extra_headers": {"x-idempotency-key": str(uuid.uuid4())},
+        }
+        if speed != 1.0:
+            create_kwargs["speed"] = max(0.25, min(4.0, speed))
+        repetition_penalty = _get_orpheus_repetition_penalty(tts_config)
+        if repetition_penalty is not None:
+            create_kwargs["extra_body"] = {"repetition_penalty": repetition_penalty}
+        response = client.audio.speech.create(**create_kwargs)
+
+        response.stream_to_file(output_path)
+        return output_path
+    finally:
+        close = getattr(client, "close", None)
+        if callable(close):
+            close()
+
+
+# ===========================================================================
 # Provider: OpenAI TTS
 # ===========================================================================
 def _generate_openai_tts(text: str, output_path: str, tts_config: Dict[str, Any]) -> str:
@@ -1078,8 +1315,7 @@ def _apply_xai_auto_speech_tags(text: str) -> str:
 
     clean = re.sub(r"\n\s*\n+", " [pause] ", clean)
     clean = re.sub(r"\s*\n\s*", " ", clean)
-    if not _XAI_SPEECH_TAG_RE.search(clean):
-        clean = _XAI_FIRST_SENTENCE_RE.sub(r"\1 [pause] ", clean, count=1)
+    clean = _XAI_FIRST_SENTENCE_RE.sub(r"\1 [pause] ", clean, count=1)
     clean = re.sub(r"\s{2,}", " ", clean).strip()
     return clean
 
@@ -1842,6 +2078,12 @@ def text_to_speech_tool(
 
     tts_config = _load_tts_config()
     provider = _get_provider(tts_config)
+    if _is_provider_forbidden(provider):
+        return json.dumps({
+            "success": False,
+            "error": f"TTS provider '{provider}' is forbidden by HERMES_FORBID_TTS_PROVIDERS for this profile.",
+            "provider": provider,
+        }, ensure_ascii=False)
 
     # User-declared command provider (type: command under tts.providers.<name>)
     # resolves BEFORE the built-in dispatch. Built-in names short-circuit here
@@ -1869,24 +2111,6 @@ def text_to_speech_tool(
 
     # Determine output path
     if output_path:
-        # Reject '..' traversal components in the user-supplied path. An
-        # explicit absolute path is fine (the agent legitimately writes
-        # audio to user-specified locations), but a path that uses ``..``
-        # to escape its declared base is almost always either a bug or
-        # prompt-injection-controlled — e.g.
-        # ``output_path="audio/../../etc/cron.d/x"``. The terminal tool
-        # can still write anywhere with approval; this just keeps the
-        # unattended TTS surface from materializing files via traversal.
-        from tools.path_security import has_traversal_component
-        if has_traversal_component(output_path):
-            return json.dumps({
-                "success": False,
-                "error": (
-                    f"output_path contains '..' traversal component: "
-                    f"{output_path}. Use an absolute path or one relative "
-                    "to the current directory without '..'."
-                ),
-            }, ensure_ascii=False)
         file_path = Path(output_path).expanduser()
         if command_provider_config is not None:
             # Respect caller-supplied path but align the extension with the
@@ -1904,7 +2128,7 @@ def text_to_speech_tool(
             file_path = out_dir / f"tts_{timestamp}.{fmt}"
         # Use .ogg for Telegram with providers that support native Opus output,
         # otherwise fall back to .mp3 (Edge TTS will attempt ffmpeg conversion later).
-        elif want_opus and provider in {"openai", "elevenlabs", "mistral", "gemini"}:
+        elif want_opus and provider in {"openai", "elevenlabs", "mistral", "gemini", "orpheus"}:
             file_path = out_dir / f"tts_{timestamp}.ogg"
         else:
             file_path = out_dir / f"tts_{timestamp}.mp3"
@@ -1923,21 +2147,6 @@ def text_to_speech_tool(
                 text, file_str, provider, command_provider_config, tts_config,
             )
 
-        # Plugin-registered TTS backend (issue #30398). Fires when the
-        # configured provider is neither a built-in nor a command-type
-        # entry, AND a plugin is registered under that name. The walrus
-        # binds `_plugin_path` only when the dispatcher returns a path
-        # (i.e. a plugin was actually found); a None return falls
-        # through to the built-in elif chain so unknown names hit the
-        # Edge TTS default at the bottom. The dispatcher itself enforces
-        # built-ins-always-win + command-wins-over-plugin defensively.
-        elif provider not in BUILTIN_TTS_PROVIDERS and (
-            _plugin_path := _dispatch_to_plugin_provider(
-                text, file_str, provider, tts_config,
-            )
-        ) is not None:
-            file_str = _plugin_path
-
         elif provider == "elevenlabs":
             try:
                 _import_elevenlabs()
@@ -1948,6 +2157,17 @@ def text_to_speech_tool(
                 }, ensure_ascii=False)
             logger.info("Generating speech with ElevenLabs...")
             _generate_elevenlabs(text, file_str, tts_config)
+
+        elif provider == "orpheus":
+            try:
+                _import_openai_client()
+            except ImportError:
+                return json.dumps({
+                    "success": False,
+                    "error": "Orpheus provider selected but 'openai' package not installed."
+                }, ensure_ascii=False)
+            logger.info("Generating speech with Orpheus TTS...")
+            _generate_orpheus_tts(text, file_str, tts_config)
 
         elif provider == "openai":
             try:
@@ -2076,18 +2296,6 @@ def text_to_speech_tool(
                     if opus_path:
                         file_str = opus_path
                 voice_compatible = file_str.endswith(".ogg")
-        elif provider not in BUILTIN_TTS_PROVIDERS:
-            # Plugin-registered provider (issue #30398). Voice-bubble
-            # delivery opts in via ``TTSProvider.voice_compatible``
-            # (mirrors the command-provider opt-in). Plugins that
-            # already write Opus skip the ffmpeg conversion.
-            plugin_voice_compatible = _plugin_provider_is_voice_compatible(provider)
-            if plugin_voice_compatible:
-                if not file_str.endswith(".ogg"):
-                    opus_path = _convert_to_opus(file_str)
-                    if opus_path:
-                        file_str = opus_path
-                voice_compatible = file_str.endswith(".ogg")
         elif (
             want_opus
             and provider in {"edge", "neutts", "minimax", "xai", "kittentts", "piper"}
@@ -2097,7 +2305,7 @@ def text_to_speech_tool(
             if opus_path:
                 file_str = opus_path
                 voice_compatible = True
-        elif provider in {"elevenlabs", "openai", "mistral", "gemini"}:
+        elif provider in {"elevenlabs", "openai", "mistral", "gemini", "orpheus"}:
             voice_compatible = want_opus and file_str.endswith(".ogg")
 
         file_size = os.path.getsize(file_str)
@@ -2240,17 +2448,29 @@ _MD_EXCESS_NL = re.compile(r'\n{3,}')
 
 
 def _strip_markdown_for_tts(text: str) -> str:
-    """Remove markdown formatting that shouldn't be spoken aloud."""
+    """Remove markdown formatting that shouldn't be spoken aloud.
+
+    Replacements that strip a token entirely (URLs, HRs) and replacements
+    that unwrap a token (bold/italic/inline-code/link) pad with a space so
+    adjacent words don't collide into ``webI`` / ``toolto`` / ``anddigital``
+    on stream-spliced or tight-formatted input. Internal whitespace is then
+    collapsed per-line so the well-formed cases ("This is **bold** text"
+    -> "This is bold text") still produce a single space between words.
+    """
     text = _MD_CODE_BLOCK.sub(' ', text)
-    text = _MD_LINK.sub(r'\1', text)
-    text = _MD_URL.sub('', text)
-    text = _MD_BOLD.sub(r'\1', text)
-    text = _MD_ITALIC.sub(r'\1', text)
-    text = _MD_INLINE_CODE.sub(r'\1', text)
+    text = _MD_LINK.sub(r' \1 ', text)
+    text = _MD_URL.sub(' ', text)
+    text = _MD_BOLD.sub(r' \1 ', text)
+    text = _MD_ITALIC.sub(r' \1 ', text)
+    text = _MD_INLINE_CODE.sub(r' \1 ', text)
     text = _MD_HEADER.sub('', text)
     text = _MD_LIST_ITEM.sub('', text)
-    text = _MD_HR.sub('', text)
+    text = _MD_HR.sub(' ', text)
     text = _MD_EXCESS_NL.sub('\n\n', text)
+    # Collapse runs of spaces/tabs introduced by the padded substitutions,
+    # but preserve newline structure so headers/lists keep their layout.
+    text = re.sub(r'[ \t]+', ' ', text)
+    text = re.sub(r' *\n *', '\n', text)
     return text.strip()
 
 

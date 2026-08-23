@@ -20,6 +20,7 @@ import tempfile
 import threading
 import time
 import wave
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -751,10 +752,22 @@ WHISPER_HALLUCINATIONS = {
     "you",
     "the end.",
     "the end",
+    # Common noise triggers observed in production (2026-05-26 diagnostics)
+    "house.",
+    "house",
+    "um.",
+    "um",
+    "um...",
+    "ha ha ha!",
+    "ha ha ha",
     # Non-English hallucinations (common on silence)
     "продолжение следует",
     "продолжение следует...",
     "sous-titres",
+    "subtitles by subtitle workshop",
+    "subtitles by subtitle workshop.",
+    "subtitles by the amara.org community",
+    "subtitles by the amara.org community.",
     "sous-titres réalisés par la communauté d'amara.org",
     "sottotitoli creati dalla comunità amara.org",
     "untertitel von stephanie geiges",
@@ -769,6 +782,15 @@ _HALLUCINATION_REPEAT_RE = re.compile(
     flags=re.IGNORECASE,
 )
 
+_SHORT_ACK_RE = re.compile(
+    r"^(?:yes|yeah|yep|ok|okay|thanks?|thank you|no|nope|bye)[.!?,\s]*$",
+    flags=re.IGNORECASE,
+)
+
+
+def _is_short_acknowledgement(transcript: str) -> bool:
+    return bool(_SHORT_ACK_RE.fullmatch((transcript or "").strip()))
+
 
 def is_whisper_hallucination(transcript: str) -> bool:
     """Check if a transcript is a known Whisper hallucination on silence."""
@@ -782,6 +804,108 @@ def is_whisper_hallucination(transcript: str) -> bool:
     if _HALLUCINATION_REPEAT_RE.match(cleaned):
         return True
     return False
+
+
+# Thresholds for short-form/live voice transcript admission. These are
+# deliberately conservative: only block cases strongly correlated with
+# Whisper-on-silence hallucinations while preserving real short commands.
+VOICE_TRANSCRIPT_SHORT_AUDIO_SECONDS = 0.75
+VOICE_TRANSCRIPT_SHORT_AUDIO_MAX_WORDS = 3
+VOICE_TRANSCRIPT_MAX_NO_SPEECH_PROB = 0.60
+VOICE_TRANSCRIPT_MIN_AVG_LOGPROB = -0.8  # Was -1.0; tightened on 2026-05-26 to reject
+                                         # low-confidence transcripts that pass on noise
+                                         # (e.g. "yo uh" at -2.5 avg_logprob)
+
+
+@dataclass(frozen=True)
+class VoiceTranscriptDecision:
+    usable: bool
+    reason: str = "accepted"
+
+
+def _segment_value(segment: Any, key: str) -> Any:
+    if isinstance(segment, dict):
+        return segment.get(key)
+    return getattr(segment, key, None)
+
+
+def _iter_segment_numbers(stt_metadata: Optional[Dict[str, Any]], key: str) -> List[float]:
+    if not stt_metadata:
+        return []
+    values: List[float] = []
+    for segment in stt_metadata.get("segments") or []:
+        raw = _segment_value(segment, key)
+        if raw is None:
+            continue
+        try:
+            values.append(float(raw))
+        except (TypeError, ValueError):
+            continue
+    return values
+
+
+def assess_voice_transcript(
+    transcript: str,
+    *,
+    audio_duration: Optional[float] = None,
+    stt_metadata: Optional[Dict[str, Any]] = None,
+    expected_language: Optional[str] = None,
+) -> VoiceTranscriptDecision:
+    """Decide whether a live voice transcript is safe to route to the LLM."""
+    cleaned = (transcript or "").strip()
+    duration: Optional[float] = None
+    if audio_duration is not None:
+        try:
+            duration = float(audio_duration)
+        except (TypeError, ValueError):
+            duration = None
+
+    hallucinated = is_whisper_hallucination(cleaned)
+    plausible_short_ack = (
+        _is_short_acknowledgement(cleaned)
+        and duration is not None
+        and duration >= VOICE_TRANSCRIPT_SHORT_AUDIO_SECONDS
+    )
+    if hallucinated and not plausible_short_ack:
+        return VoiceTranscriptDecision(False, "whisper_hallucination")
+
+    if duration is not None and duration < VOICE_TRANSCRIPT_SHORT_AUDIO_SECONDS:
+        words = re.findall(r"\b[\w'$-]+\b", cleaned)
+        if len(words) > VOICE_TRANSCRIPT_SHORT_AUDIO_MAX_WORDS:
+            return VoiceTranscriptDecision(False, "too_many_words_for_short_audio")
+
+    if expected_language and stt_metadata:
+        detected_language = str(stt_metadata.get("language") or "").strip().lower()
+        expected = str(expected_language).strip().lower()
+        if detected_language and expected and detected_language != expected:
+            return VoiceTranscriptDecision(False, "unexpected_language")
+
+    no_speech_probs = _iter_segment_numbers(stt_metadata, "no_speech_prob")
+    no_speech_limit = 0.90 if plausible_short_ack else VOICE_TRANSCRIPT_MAX_NO_SPEECH_PROB
+    if no_speech_probs and min(no_speech_probs) > no_speech_limit:
+        return VoiceTranscriptDecision(False, "high_no_speech_probability")
+
+    avg_logprobs = _iter_segment_numbers(stt_metadata, "avg_logprob")
+    if avg_logprobs and max(avg_logprobs) < VOICE_TRANSCRIPT_MIN_AVG_LOGPROB:
+        return VoiceTranscriptDecision(False, "low_average_logprob")
+
+    return VoiceTranscriptDecision(True, "accepted")
+
+
+def is_voice_transcript_usable(
+    transcript: str,
+    *,
+    audio_duration: Optional[float] = None,
+    stt_metadata: Optional[Dict[str, Any]] = None,
+    expected_language: Optional[str] = None,
+) -> VoiceTranscriptDecision:
+    """Compatibility wrapper used by live Discord voice input."""
+    return assess_voice_transcript(
+        transcript,
+        audio_duration=audio_duration,
+        stt_metadata=stt_metadata,
+        expected_language=expected_language,
+    )
 
 
 # ============================================================================

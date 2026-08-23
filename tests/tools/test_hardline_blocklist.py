@@ -113,6 +113,7 @@ _HARDLINE_ALLOW = [
     "cat /dev/urandom | head -c 10",
     # Unrelated commands that happen to contain the trigger word
     "grep 'shutdown' logs.txt",
+    'grep "restart\\|Restart\\|restarted\\|Restarted\\|crash\\|Crash\\|CRASH\\|shutdown\\|Shutdown" /home/kayai3/.hermes/profiles/orpheusab/logs/gateway.log | tail -30',
     "echo reboot",
     "echo '# init 0 in comment'",
     "cat rebooting.log",

@@ -1149,6 +1149,58 @@ def _transcribe_local(file_path: str, model_name: str) -> Dict[str, Any]:
         return {"success": False, "transcript": "", "error": f"Local transcription failed: {e}"}
 
 
+def prewarm_local_stt_model(model: Optional[str] = None) -> bool:
+    """Load the local faster-whisper model into memory without transcribing.
+
+    This gives the first real transcription a warm cache, cutting first-
+    utterance latency.  It is a no-op and returns False when faster-whisper is
+    not installed, when STT is disabled, or when the configured provider is not
+    ``local``.  Any error is logged and swallowed so callers can safely fire
+    this from a background task.
+    """
+    try:
+        stt_config = _load_stt_config()
+        if not is_stt_enabled(stt_config):
+            logger.debug("STT is disabled; skipping local STT model prewarm")
+            return False
+
+        provider = _get_provider(stt_config)
+        if provider != "local":
+            logger.debug(
+                "Configured STT provider is '%s', not 'local'; skipping model prewarm",
+                provider,
+            )
+            return False
+
+        if not _HAS_FASTER_WHISPER:
+            if not _try_lazy_install_stt():
+                logger.debug("faster-whisper not available; skipping local STT model prewarm")
+                return False
+
+        local_cfg = stt_config.get("local", {})
+        model_name = _normalize_local_model(model or local_cfg.get("model", DEFAULT_LOCAL_MODEL))
+
+        global _local_model, _local_model_name
+        if _local_model is not None and _local_model_name == model_name:
+            logger.debug("Local faster-whisper model '%s' already loaded", model_name)
+            return True
+
+        logger.info("Prewarming local faster-whisper model '%s'...", model_name)
+        _local_model = _load_local_whisper_model(model_name)
+        _local_model_name = model_name
+        logger.info("Local faster-whisper model '%s' prewarmed", model_name)
+        return True
+    except Exception as e:
+        logger.warning("Local STT model prewarm failed: %s", e)
+        return False
+
+
+# Backwards-compatible alias used by gateway/run.py
+def prewarm_local_stt() -> bool:
+    """Backwards-compatible alias for :func:`prewarm_local_stt_model`."""
+    return prewarm_local_stt_model()
+
+
 def _prepare_local_audio(file_path: str, work_dir: str) -> tuple[Optional[str], Optional[str]]:
     """Normalize audio for local CLI STT when needed."""
     audio_path = Path(file_path)

@@ -3604,10 +3604,16 @@ class BasePlatformAdapter(ABC):
                 # an explicit ``/voice on|tts`` opt-in OR when ``voice.auto_tts`` is
                 # True globally and no ``/voice off`` has been issued.
                 _tts_path = None
+                # Skip auto-TTS when the Discord voice pipeline already spoke or
+                # attempted TTS this turn — gateway/run.py sets
+                # ``event.suppress_auto_tts = True`` after the PCM pipeline closes
+                # so the legacy full-file TTS does not replay the same text after
+                # live phrase chunks have already been delivered.
                 if (self._should_auto_tts_for_chat(event.source.chat_id)
                         and event.message_type == MessageType.VOICE
                         and text_content
-                        and not media_files):
+                        and not media_files
+                        and not getattr(event, "suppress_auto_tts", False)):
                     try:
                         from tools.tts_tool import text_to_speech_tool, check_tts_requirements
                         if check_tts_requirements():

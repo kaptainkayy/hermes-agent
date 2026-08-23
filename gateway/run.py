@@ -42,7 +42,7 @@ from collections import OrderedDict
 from contextvars import copy_context
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, Optional, Any, List, Union
+from typing import AsyncIterator, Dict, Optional, Any, List, Union
 
 # account_usage imports the OpenAI SDK chain (~230 ms). Only needed by
 # /usage; we still import it at module top in the gateway because test
@@ -65,6 +65,9 @@ _AGENT_CACHE_MAX_SIZE = 128
 _AGENT_CACHE_IDLE_TTL_SECS = 3600.0  # evict agents idle for >1h
 _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
 _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
+_DISCORD_VOICE_MAX_TOKENS_DEFAULT = 80
+_DISCORD_VOICE_MODEL_DEFAULT = "google/gemini-3.1-flash-lite"
+_DISCORD_VOICE_PROVIDER_DEFAULT = "openrouter"
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 
 _TELEGRAM_NOISY_STATUS_RE = re.compile(
@@ -139,83 +142,105 @@ def _gateway_platform_value(platform: Any) -> str:
     return str(getattr(platform, "value", platform) or "").strip().lower()
 
 
-def _is_transient_network_error(exc: BaseException) -> bool:
-    """Return True for transient network errors safe to log + swallow.
+def _discord_voice_max_tokens() -> int:
+    """Return the low-latency Discord voice output-token cap.
 
-    The crash class targeted by #31066 / #31110: an unhandled Telegram
-    ``TimedOut`` (or peer ``NetworkError`` / ``httpx`` connection error)
-    propagating to the event loop and killing the entire gateway
-    process. These are by definition transient — the next poll cycle or
-    user action recovers — so they must never crash the process.
-
-    Walk the exception cause chain so wrapped errors (e.g. PTB's
-    ``NetworkError`` wrapping ``httpx.ConnectError``) are still
-    classified. The chain is bounded to avoid pathological cycles.
+    Live voice should optimize for conversational turn-taking rather than
+    reading paragraph-length answers.  Keep the env var override, but default to
+    a short spoken-answer budget; deterministic count/list paths bypass this
+    when they need complete enumerations.
     """
-    seen: set[int] = set()
-    cur: Optional[BaseException] = exc
-    depth = 0
-    transient_class_names = {
-        "TimedOut",
-        "NetworkError",
-        "ReadError",
-        "WriteError",
-        "ConnectError",
-        "ConnectTimeout",
-        "ReadTimeout",
-        "WriteTimeout",
-        "PoolTimeout",
-        "RemoteProtocolError",
-        "ServerDisconnectedError",
-        "ClientConnectorError",
-        "ClientOSError",
+    raw = os.getenv("HERMES_DISCORD_VOICE_MAX_TOKENS")
+    if raw is None or raw == "":
+        return _DISCORD_VOICE_MAX_TOKENS_DEFAULT
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return _DISCORD_VOICE_MAX_TOKENS_DEFAULT
+
+
+def _discord_voice_fallback_models() -> List[Dict[str, str]]:
+    """Return OpenRouter fallback models for low-latency Discord voice."""
+    raw = os.getenv("HERMES_DISCORD_VOICE_FALLBACK_MODELS", "").strip()
+    if not raw:
+        return []
+    provider = os.getenv("HERMES_DISCORD_VOICE_PROVIDER", "openrouter").strip() or "openrouter"
+    fallbacks: List[Dict[str, str]] = []
+    for item in raw.split(","):
+        model = item.strip()
+        if model:
+            fallbacks.append({"provider": provider, "model": model})
+    return fallbacks
+
+
+def _discord_voice_model() -> str:
+    """Return the model used for Discord live voice turns.
+
+    Voice must never silently fall back to the profile's default model: the
+    normal gateway model can be slower, tool-heavy, and more prone to language
+    drift.  Keep the env override, but provide a safe low-latency default.
+    """
+    return os.getenv("HERMES_DISCORD_VOICE_MODEL", "").strip() or _DISCORD_VOICE_MODEL_DEFAULT
+
+
+def _discord_voice_provider() -> str:
+    """Return the provider used for Discord live voice turns."""
+    return os.getenv("HERMES_DISCORD_VOICE_PROVIDER", "").strip() or _DISCORD_VOICE_PROVIDER_DEFAULT
+
+
+def _discord_voice_fast_prompt() -> str:
+    """Return the prompt appended to Discord live voice turns."""
+    return os.getenv(
+        "HERMES_DISCORD_VOICE_FAST_PROMPT",
+        (
+            "Discord live voice mode: reply in English only unless the user explicitly asks "
+            "for another language. Prioritize low latency: be conversational, warm, and concise. "
+            "Usually answer in one short sentence. Avoid tools, lists, and long explanations unless required."
+        ),
+    ).strip()
+
+
+def _discord_voice_wake_enabled() -> bool:
+    """Return whether live Discord voice requires a wake phrase."""
+    return os.getenv("HERMES_DISCORD_VOICE_WAKE_ENABLED", "true").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
     }
-    while cur is not None and depth < 12:
-        ident = id(cur)
-        if ident in seen:
-            break
-        seen.add(ident)
-        depth += 1
-        name = type(cur).__name__
-        if name in transient_class_names:
-            return True
-        cur = cur.__cause__ or cur.__context__
-    return False
 
 
-def _gateway_loop_exception_handler(
-    loop: "asyncio.AbstractEventLoop", context: Dict[str, Any]
-) -> None:
-    """Loop-level safety net for transient network errors.
+def _discord_voice_wake_names(adapter: Any = None) -> List[str]:
+    """Return names accepted in "hey <name>" live voice wake phrases."""
+    raw = os.getenv("HERMES_DISCORD_VOICE_WAKE_NAMES", "").strip()
+    if not raw:
+        raw = os.getenv("HERMES_DISCORD_VOICE_WAKE_NAME", "").strip()
+    names = [item.strip() for item in re.split(r"[,|]", raw) if item.strip()]
+    if names:
+        return names
 
-    Installed once during :func:`start_gateway`. Catches the
-    ``telegram.error.TimedOut`` crash class (issues #31066 / #31110)
-    and any peer transient network error before it can kill the
-    gateway process. Logs at WARNING with full traceback so the
-    originating call site stays diagnosable; non-transient errors
-    are forwarded to the default loop handler so real bugs still
-    surface.
-    """
-    exc = context.get("exception")
-    if exc is not None and _is_transient_network_error(exc):
-        message = context.get("message") or "transient network error"
-        task = context.get("future") or context.get("task")
-        task_name = ""
-        if task is not None:
-            try:
-                task_name = task.get_name() if hasattr(task, "get_name") else repr(task)
-            except Exception:
-                task_name = repr(task)
-        logger.warning(
-            "Gateway swallowed transient network error from %s: %s: %s",
-            task_name or "<unknown task>",
-            type(exc).__name__,
-            exc,
-            exc_info=(type(exc), exc, exc.__traceback__),
-        )
-        return
-    # Fall back to the default handler for anything we don't recognise.
-    loop.default_exception_handler(context)
+    client = getattr(adapter, "_client", None)
+    user = getattr(client, "user", None)
+    for attr in ("display_name", "global_name", "name"):
+        value = str(getattr(user, attr, "") or "").strip()
+        if value:
+            return [value]
+    return ["Hermes", "Persephone"]
+
+
+def _strip_discord_voice_wake_phrase(transcript: str, names: List[str]) -> Optional[str]:
+    """Strip a leading "hey <name>" phrase, or return None when it is absent."""
+    text = re.sub(r"\s+", " ", str(transcript or "")).strip()
+    if not text:
+        return None
+    for name in names:
+        normalized_name = r"\s+".join(re.escape(part) for part in name.strip().split())
+        if not normalized_name:
+            continue
+        match = re.match(rf"(?i)^hey[\s,]+{normalized_name}\b[\s,;:\-]*(.*)$", text)
+        if match:
+            return match.group(1).strip() or "Hello."
+    return None
 
 
 def _redact_gateway_user_facing_secrets(text: str) -> str:
@@ -853,29 +878,31 @@ if _config_path.exists():
                         os.environ[_env_var] = str(_val)
         # Compression config is read directly from config.yaml by run_agent.py
         # and auxiliary_client.py — no env var bridging needed.
-        # Auxiliary model/direct-endpoint overrides (vision, web_extract,
-        # approval, plus any plugin-registered auxiliary tasks).
-        # Each task has provider/model/base_url/api_key; bridge non-default
-        # values to env vars named AUXILIARY_<KEY_UPPER>_*. The legacy
-        # hard-coded list (vision/web_extract/approval) is replaced by a
-        # dynamic loop so plugin-registered tasks benefit from the same
-        # config→env bridging without core knowing about each one.
+        # Auxiliary model/direct-endpoint overrides (vision, web_extract).
+        # Each task has provider/model/base_url/api_key; bridge non-default values to env vars.
         _auxiliary_cfg = _cfg.get("auxiliary", {})
         if _auxiliary_cfg and isinstance(_auxiliary_cfg, dict):
-            # Built-in tasks that previously had explicit env-var bridging.
-            # Kept here as the canonical bridged set; plugin tasks are added
-            # below via the plugin auxiliary registry.
-            _aux_bridged_keys = {"vision", "web_extract", "approval"}
-            try:
-                from hermes_cli.plugins import get_plugin_auxiliary_tasks
-                for _entry in get_plugin_auxiliary_tasks():
-                    _aux_bridged_keys.add(_entry["key"])
-            except Exception:
-                # Plugin discovery failure must not break gateway startup;
-                # built-in bridging stays intact.
-                pass
-
-            for _task_key in _aux_bridged_keys:
+            _aux_task_env = {
+                "vision": {
+                    "provider": "AUXILIARY_VISION_PROVIDER",
+                    "model": "AUXILIARY_VISION_MODEL",
+                    "base_url": "AUXILIARY_VISION_BASE_URL",
+                    "api_key": "AUXILIARY_VISION_API_KEY",
+                },
+                "web_extract": {
+                    "provider": "AUXILIARY_WEB_EXTRACT_PROVIDER",
+                    "model": "AUXILIARY_WEB_EXTRACT_MODEL",
+                    "base_url": "AUXILIARY_WEB_EXTRACT_BASE_URL",
+                    "api_key": "AUXILIARY_WEB_EXTRACT_API_KEY",
+                },
+                "approval": {
+                    "provider": "AUXILIARY_APPROVAL_PROVIDER",
+                    "model": "AUXILIARY_APPROVAL_MODEL",
+                    "base_url": "AUXILIARY_APPROVAL_BASE_URL",
+                    "api_key": "AUXILIARY_APPROVAL_API_KEY",
+                },
+            }
+            for _task_key, _env_map in _aux_task_env.items():
                 _task_cfg = _auxiliary_cfg.get(_task_key, {})
                 if not isinstance(_task_cfg, dict):
                     continue
@@ -883,15 +910,14 @@ if _config_path.exists():
                 _model = str(_task_cfg.get("model", "")).strip()
                 _base_url = str(_task_cfg.get("base_url", "")).strip()
                 _api_key = str(_task_cfg.get("api_key", "")).strip()
-                _upper = _task_key.upper()
                 if _prov and _prov != "auto":
-                    os.environ[f"AUXILIARY_{_upper}_PROVIDER"] = _prov
+                    os.environ[_env_map["provider"]] = _prov
                 if _model:
-                    os.environ[f"AUXILIARY_{_upper}_MODEL"] = _model
+                    os.environ[_env_map["model"]] = _model
                 if _base_url:
-                    os.environ[f"AUXILIARY_{_upper}_BASE_URL"] = _base_url
+                    os.environ[_env_map["base_url"]] = _base_url
                 if _api_key:
-                    os.environ[f"AUXILIARY_{_upper}_API_KEY"] = _api_key
+                    os.environ[_env_map["api_key"]] = _api_key
         # config.yaml is the documented, authoritative source for these
         # settings — it unconditionally wins over .env values. Previously
         # the guards below read `if X not in os.environ` and let stale
@@ -918,8 +944,6 @@ if _config_path.exists():
         if _display_cfg and isinstance(_display_cfg, dict):
             if "busy_input_mode" in _display_cfg:
                 os.environ["HERMES_GATEWAY_BUSY_INPUT_MODE"] = str(_display_cfg["busy_input_mode"])
-            if "busy_text_mode" in _display_cfg:
-                os.environ["HERMES_GATEWAY_BUSY_TEXT_MODE"] = str(_display_cfg["busy_text_mode"])
             if "busy_ack_enabled" in _display_cfg:
                 os.environ["HERMES_GATEWAY_BUSY_ACK_ENABLED"] = str(_display_cfg["busy_ack_enabled"])
         # Timezone: bridge config.yaml → HERMES_TIMEZONE env var.
@@ -932,27 +956,6 @@ if _config_path.exists():
             _redact = _security_cfg.get("redact_secrets")
             if _redact is not None:
                 os.environ["HERMES_REDACT_SECRETS"] = str(_redact).lower()
-        # Gateway settings (media delivery allowlist + recency trust)
-        _gateway_cfg = _cfg.get("gateway", {})
-        if isinstance(_gateway_cfg, dict):
-            _allow_dirs = _gateway_cfg.get("media_delivery_allow_dirs")
-            if _allow_dirs:
-                if isinstance(_allow_dirs, str):
-                    _allow_dirs_str = _allow_dirs
-                elif isinstance(_allow_dirs, (list, tuple)):
-                    _allow_dirs_str = os.pathsep.join(str(p) for p in _allow_dirs if p)
-                else:
-                    _allow_dirs_str = ""
-                if _allow_dirs_str:
-                    os.environ["HERMES_MEDIA_ALLOW_DIRS"] = _allow_dirs_str
-            _trust_recent = _gateway_cfg.get("trust_recent_files")
-            if _trust_recent is not None:
-                os.environ["HERMES_MEDIA_TRUST_RECENT_FILES"] = (
-                    "1" if _trust_recent else "0"
-                )
-            _trust_recent_seconds = _gateway_cfg.get("trust_recent_files_seconds")
-            if _trust_recent_seconds is not None:
-                os.environ["HERMES_MEDIA_TRUST_RECENT_SECONDS"] = str(_trust_recent_seconds)
     except Exception as _bridge_err:
         # Previously this was silent (`except Exception: pass`), which
         # hid partial bridge failures and let .env defaults shadow
@@ -1064,12 +1067,6 @@ _AGENT_PENDING_SENTINEL = object()
 def _resolve_runtime_agent_kwargs() -> dict:
     """Resolve provider credentials for gateway-created AIAgent instances.
 
-    Provider is read from ``config.yaml`` ``model.provider`` (the single
-    source of truth). ``resolve_runtime_provider()`` falls through to env
-    var lookups internally for legacy compatibility, but the gateway does
-    not consult environment variables for behavioral config — config.yaml
-    is authoritative.
-
     If the primary provider fails with an authentication error, attempt to
     resolve credentials using the fallback provider chain from config.yaml
     before giving up.
@@ -1081,7 +1078,9 @@ def _resolve_runtime_agent_kwargs() -> dict:
     from hermes_cli.auth import AuthError
 
     try:
-        runtime = resolve_runtime_provider()
+        runtime = resolve_runtime_provider(
+            requested=os.getenv("HERMES_INFERENCE_PROVIDER"),
+        )
     except AuthError as auth_exc:
         # Primary provider auth failed (expired token, revoked key, etc.).
         # Try the fallback provider chain before raising.
@@ -1263,7 +1262,7 @@ def _is_control_interrupt_message(message: Optional[str]) -> bool:
     if not message:
         return False
     normalized = " ".join(str(message).strip().split()).lower()
-    return normalized in _CONTROL_INTERRUPT_MESSAGES
+    return normalized in _CONTROL_INTERRUPT_MESSAGES or normalized.startswith("operation interrupted:")
 
 
 def _skill_slug_from_frontmatter(skill_md: Path) -> tuple[str | None, str | None]:
@@ -1656,7 +1655,6 @@ class GatewayRunner:
     # blow up on attribute access.
     _running_agents_ts: Dict[str, float] = {}
     _busy_input_mode: str = "interrupt"
-    _busy_text_mode: str = "interrupt"
     _restart_drain_timeout: float = DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT
     _exit_code: Optional[int] = None
     _draining: bool = False
@@ -1683,7 +1681,6 @@ class GatewayRunner:
         self._service_tier = self._load_service_tier()
         self._show_reasoning = self._load_show_reasoning()
         self._busy_input_mode = self._load_busy_input_mode()
-        self._busy_text_mode = self._load_busy_text_mode()
         self._restart_drain_timeout = self._load_restart_drain_timeout()
         self._provider_routing = self._load_provider_routing()
         self._fallback_model = self._load_fallback_model()
@@ -2293,14 +2290,13 @@ class GatewayRunner:
     ) -> Optional[str]:
         """Pin DM-topic routing to the user's last-active topic.
 
-        Telegram can omit ``message_thread_id`` or surface General (``1``)
-        for some topic-mode DM replies. In those lobby-shaped cases, keep the
-        conversation attached to the user's most-recent bound topic.
-
-        Do not rewrite a non-lobby, previously-unbound thread id: a newly
-        created Telegram DM topic is also "unknown" until the first inbound
-        message is recorded, and rewriting it would send that brand-new topic's
-        answer into an older lane. Returns None to leave the source alone.
+        Telegram fragments topic-mode DMs two ways: a Reply on a message
+        in another topic delivers ``message_thread_id`` for *that* topic,
+        and ``_build_message_event`` strips the thread_id on plain replies
+        (#3206 — needed for non-topic users). Both route the user to the
+        wrong session. When topic mode is on, rewrite the thread_id to the
+        user's most-recent binding if the inbound id is missing/General or
+        not a known topic for this chat. Returns None to leave it alone.
         """
         if (
             source.platform != Platform.TELEGRAM
@@ -2309,14 +2305,6 @@ class GatewayRunner:
             or not source.user_id
             or not self._telegram_topic_mode_enabled(source)
         ):
-            return None
-        inbound = str(source.thread_id or "")
-        is_lobby = not inbound or inbound in self._TELEGRAM_GENERAL_TOPIC_IDS
-        if not is_lobby:
-            # A non-lobby, unknown thread_id is most likely the first message in
-            # a brand-new Telegram DM topic. Preserve it so it can be recorded
-            # as a new independent lane below instead of hijacking the latest
-            # existing topic binding.
             return None
         session_db = getattr(self, "_session_db", None)
         if session_db is None:
@@ -2329,6 +2317,11 @@ class GatewayRunner:
             logger.debug("topic-recover: read failed", exc_info=True)
             return None
         if not bindings:
+            return None
+        inbound = str(source.thread_id or "")
+        is_lobby = not inbound or inbound in self._TELEGRAM_GENERAL_TOPIC_IDS
+        known = {str(b.get("thread_id") or "") for b in bindings}
+        if not is_lobby and inbound in known:
             return None
         user_id = str(source.user_id)
         for b in bindings:  # newest-first
@@ -2935,17 +2928,6 @@ class GatewayRunner:
         return "interrupt"
 
     @staticmethod
-    def _load_busy_text_mode() -> str:
-        """Load normal busy TEXT follow-up behavior from config/env."""
-        mode = os.getenv("HERMES_GATEWAY_BUSY_TEXT_MODE", "").strip().lower()
-        if not mode:
-            cfg = _load_gateway_runtime_config()
-            mode = str(cfg_get(cfg, "display", "busy_text_mode", default="") or "").strip().lower()
-        if mode == "interrupt":
-            return "interrupt"
-        return "queue"
-
-    @staticmethod
     def _load_restart_drain_timeout() -> float:
         """Load graceful gateway restart/stop drain timeout in seconds."""
         raw = os.getenv("HERMES_RESTART_DRAIN_TIMEOUT", "").strip()
@@ -3034,44 +3016,6 @@ class GatewayRunner:
             if agent is not _AGENT_PENDING_SENTINEL
         }
 
-    @staticmethod
-    def _agent_has_active_subagents(running_agent: Any) -> bool:
-        """Return True when *running_agent* is currently driving subagents
-        via the ``delegate_task`` tool.
-
-        Background (#30170): ``AIAgent.interrupt()`` cascades through the
-        parent's ``_active_children`` list and calls ``interrupt()`` on
-        every child synchronously, which aborts in-flight subagent work
-        and produces a fallback cascade with no actionable signal.
-        Demoting ``busy_input_mode='interrupt'`` to ``queue`` semantics
-        whenever this helper returns True protects subagent work from
-        conversational follow-ups while leaving the explicit ``/stop``
-        path (which goes through ``_interrupt_and_clear_session``)
-        untouched. Safe-by-default: returns False on any attribute or
-        lock error so a missing/broken parent never blocks the existing
-        interrupt path.
-        """
-        if running_agent is None or running_agent is _AGENT_PENDING_SENTINEL:
-            return False
-        children = getattr(running_agent, "_active_children", None)
-        # AIAgent always initialises this as a concrete list (see
-        # agent/agent_init.py). Reject anything that isn't a real
-        # collection — this guards against ``MagicMock()._active_children``
-        # auto-creating a truthy stub in tests and triggering the demotion
-        # against an agent that doesn't actually have subagents.
-        if not isinstance(children, (list, tuple, set)):
-            return False
-        if not children:
-            return False
-        lock = getattr(running_agent, "_active_children_lock", None)
-        try:
-            if lock is not None:
-                with lock:
-                    return bool(children)
-            return bool(children)
-        except Exception:
-            return False
-
     def _queue_or_replace_pending_event(self, session_key: str, event: MessageEvent) -> None:
         adapter = self.adapters.get(event.source.platform)
         if not adapter:
@@ -3130,39 +3074,31 @@ class GatewayRunner:
 
         running_agent = self._running_agents.get(session_key)
 
-        effective_mode = self._busy_input_mode
-        busy_text_mode = getattr(self, "_busy_text_mode", "queue")
-        if (
-            event.message_type == MessageType.TEXT
-            and busy_text_mode == "queue"
-            and effective_mode != "steer"
-        ):
-            return False
-
         # Steer mode: inject mid-run via running_agent.steer() instead of
         # queueing + interrupting.  If the agent isn't running yet
         # (sentinel) or lacks steer(), or the payload is empty, fall back
         # to queue semantics so nothing is lost.
-        # #30170 — Subagent protection. ``AIAgent.interrupt()`` cascades
-        # to every entry in the parent's ``_active_children`` list and
-        # aborts in-flight ``delegate_task`` work. Demote ``interrupt``
-        # to ``queue`` when the parent is currently driving subagents so
-        # a conversational follow-up doesn't destroy minutes of subagent
-        # work. Explicit ``/stop`` and ``/new`` slash commands go through
-        # ``_interrupt_and_clear_session`` and are unaffected — the
-        # operator still has a way to force-cancel everything.
-        demoted_for_subagents = (
-            effective_mode == "interrupt"
-            and self._agent_has_active_subagents(running_agent)
-        )
-        if demoted_for_subagents:
-            logger.info(
-                "Demoting busy_input_mode 'interrupt' to 'queue' for session %s "
-                "because the running agent has active subagents (#30170)",
-                session_key,
-            )
-            effective_mode = "queue"
+        effective_mode = self._busy_input_mode
         steered = False
+        if (
+            effective_mode == "interrupt"
+            and event.source.platform == Platform.DISCORD
+            and event.message_type == MessageType.VOICE
+            and os.environ.get("HERMES_DISCORD_VOICE_BUSY_INPUT_MODE", "queue").strip().lower() == "queue"
+        ):
+            barge_in_enabled = os.getenv("HERMES_DISCORD_VOICE_BARGE_IN", "false").strip().lower() in {"1", "true", "yes", "on"}
+            if barge_in_enabled:
+                # For live voice, a new utterance should interrupt an in-flight
+                # model turn.  Queueing makes the bot feel deaf for 7-15s while
+                # the old LLM call finishes.  Playback-layer barge-in handles
+                # active TTS; this branch handles the model-thinking window.
+                effective_mode = "interrupt"
+                logger.info("Discord voice busy input interrupting active model turn due to barge-in")
+            else:
+                # When barge-in is disabled, preserve the conservative queue
+                # behavior so no spoken transcript is lost.
+                effective_mode = "queue"
+                logger.info("Discord voice busy input queued instead of interrupting active model turn")
         if effective_mode == "steer":
             steer_text = (event.text or "").strip()
             can_steer = (
@@ -3186,12 +3122,7 @@ class GatewayRunner:
         # successful steer — the text already landed inside the run and
         # must NOT also be replayed as a next-turn user message.
         if not steered:
-            merge_pending_message_event(
-                adapter._pending_messages,
-                session_key,
-                event,
-                merge_text=event.message_type == MessageType.TEXT,
-            )
+            merge_pending_message_event(adapter._pending_messages, session_key, event)
 
         is_queue_mode = effective_mode == "queue"
         is_steer_mode = effective_mode == "steer"
@@ -3248,14 +3179,6 @@ class GatewayRunner:
             message = (
                 f"⏩ Steered into current run{status_detail}. "
                 f"Your message arrives after the next tool call."
-            )
-        elif is_queue_mode and demoted_for_subagents:
-            # #30170 — explain the demotion so the user knows their
-            # follow-up didn't accidentally kill the subagent and
-            # discovers `/stop` as the explicit escape hatch.
-            message = (
-                f"⏳ Subagent working{status_detail} — your message is queued for "
-                f"when it finishes (use /stop to cancel everything)."
             )
         elif is_queue_mode:
             message = (
@@ -3954,7 +3877,47 @@ class GatewayRunner:
                 "security advisory check failed at gateway startup",
                 exc_info=True,
             )
-        
+
+        # ── Discord voice low-latency route verification ─────────────────
+        # The voice low-latency path must never silently fall through to the
+        # full profile model.  Env vars may override these values, but defaults
+        # keep live Discord voice on the fast no-tools route.
+        try:
+            _voice_model = _discord_voice_model()
+            _voice_provider = _discord_voice_provider()
+            logger.info(
+                "Discord voice low-latency route configured: model=%s provider=%s%s",
+                _voice_model,
+                _voice_provider,
+                " (defaults)" if (
+                    not os.getenv("HERMES_DISCORD_VOICE_MODEL", "").strip()
+                    or not os.getenv("HERMES_DISCORD_VOICE_PROVIDER", "").strip()
+                ) else "",
+            )
+            _voice_max_iter = int(os.getenv("HERMES_DISCORD_VOICE_MAX_ITERATIONS", "2"))
+            logger.info(
+                "Discord voice max_iterations=%d "
+                "(setting HERMES_DISCORD_VOICE_MAX_ITERATIONS in .env to override)",
+                _voice_max_iter,
+            )
+        except Exception:
+            logger.debug("Voice low-latency env check failed", exc_info=True)
+
+        # ── onnxruntime availability check for VAD ────────────────────────
+        # faster-whisper's VAD filter requires onnxruntime.  When missing,
+        # local STT degrades (no voice activity detection) which increases
+        # hallucination rates on short/noisy audio.
+        try:
+            import onnxruntime  # noqa: F401
+            logger.debug("onnxruntime available — VAD filter enabled for local STT")
+        except ImportError:
+            logger.warning(
+                "onnxruntime not installed — faster-whisper VAD filter "
+                "will be unavailable. Local STT may produce more "
+                "hallucinations on short audio. Install with: "
+                "pip install onnxruntime"
+            )
+
         # Warn if no user allowlists are configured and open access is not opted in
         _builtin_allowed_vars = (
             "TELEGRAM_ALLOWED_USERS", "DISCORD_ALLOWED_USERS",
@@ -4131,7 +4094,6 @@ class GatewayRunner:
             adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
             adapter.set_session_store(self.session_store)
             adapter.set_busy_session_handler(self._handle_active_session_busy_message)
-            adapter._busy_text_mode = self._busy_text_mode
             
             # Try to connect
             logger.info("Connecting to %s...", platform.value)
@@ -4154,6 +4116,44 @@ class GatewayRunner:
                         error_message=None,
                     )
                     logger.info("✓ %s connected", platform.value)
+                    if platform.value == "discord":
+                        if hasattr(adapter, "_voice_input_callback"):
+                            adapter._voice_input_callback = self._handle_voice_channel_input
+                        if hasattr(adapter, "_on_voice_disconnect"):
+                            adapter._on_voice_disconnect = self._handle_voice_timeout_cleanup
+                        auto_join_channel_id = os.getenv("HERMES_DISCORD_AUTO_JOIN_CHANNEL_ID", "").strip()
+                        auto_join_text_channel_id = os.getenv("HERMES_DISCORD_AUTO_JOIN_TEXT_CHANNEL_ID", "").strip() or os.getenv("DISCORD_HOME_CHANNEL", "").strip().strip('"\'')
+                        auto_join_on_start = os.getenv("HERMES_DISCORD_AUTO_JOIN_ON_START", "false").lower().strip() in {"1", "true", "yes", "on"}
+                        auto_join_on_user = os.getenv("HERMES_DISCORD_AUTO_JOIN_ON_USER", "false").lower().strip() in {"1", "true", "yes", "on"}
+                        if auto_join_channel_id and hasattr(adapter, "join_voice_channel"):
+                            try:
+                                voice_channel = adapter._client.get_channel(int(auto_join_channel_id))
+                                if voice_channel is None:
+                                    voice_channel = await adapter._client.fetch_channel(int(auto_join_channel_id))
+                                humans_in_channel = any(
+                                    not getattr(member, "bot", False)
+                                    for member in (getattr(voice_channel, "members", []) or [])
+                                )
+                                should_join_now = auto_join_on_start or (auto_join_on_user and humans_in_channel)
+                                if not should_join_now:
+                                    logger.info(
+                                        "Discord auto-join deferred until a user joins voice channel %s",
+                                        auto_join_channel_id,
+                                    )
+                                    continue
+                                joined = await adapter.join_voice_channel(voice_channel)
+                                if joined:
+                                    guild_id = int(getattr(getattr(voice_channel, "guild", None), "id", 0) or 0)
+                                    if guild_id and auto_join_text_channel_id:
+                                        adapter._voice_text_channels[guild_id] = int(auto_join_text_channel_id)
+                                        self._voice_mode[self._voice_key(Platform.DISCORD, auto_join_text_channel_id)] = "all"
+                                        self._save_voice_modes()
+                                        self._set_adapter_auto_tts_enabled(adapter, auto_join_text_channel_id, enabled=True)
+                                    logger.info("Discord auto-joined voice channel %s", auto_join_channel_id)
+                                else:
+                                    logger.warning("Discord auto-join failed for voice channel %s", auto_join_channel_id)
+                            except Exception as e:
+                                logger.warning("Discord auto-join error for voice channel %s: %s", auto_join_channel_id, e)
                 else:
                     logger.warning("✗ %s failed to connect", platform.value)
                     # Defensive cleanup: a failed connect() may have
@@ -4279,6 +4279,17 @@ class GatewayRunner:
         # Update delivery router with adapters
         self.delivery_router.adapters = self.adapters
         self._wire_teams_pipeline_runtime()
+
+        # Prewarm the local STT model if appropriate (background thread, non-blocking)
+        try:
+            from tools.transcription_tools import prewarm_local_stt
+
+            async def _prewarm_local_stt_background() -> None:
+                await asyncio.to_thread(prewarm_local_stt)
+
+            asyncio.create_task(_prewarm_local_stt_background())
+        except Exception as e:
+            logger.debug("Failed to invoke local STT prewarm: %s", e)
 
         self._running = True
         self._update_runtime_status("running")
@@ -5744,7 +5755,6 @@ class GatewayRunner:
                     adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
                     adapter.set_session_store(self.session_store)
                     adapter.set_busy_session_handler(self._handle_active_session_busy_message)
-                    adapter._busy_text_mode = self._busy_text_mode
 
                     success = await self._connect_adapter_with_timeout(adapter, platform)
                     if success:
@@ -6294,7 +6304,7 @@ class GatewayRunner:
                 check_wecom_callback_requirements,
             )
             if not check_wecom_callback_requirements():
-                logger.warning("WeComCallback: aiohttp/httpx/defusedxml not installed")
+                logger.warning("WeComCallback: aiohttp/httpx not installed")
                 return None
             return WecomCallbackAdapter(config)
 
@@ -6311,6 +6321,13 @@ class GatewayRunner:
                 logger.warning("Weixin: aiohttp/cryptography not installed")
                 return None
             return WeixinAdapter(config)
+
+        elif platform == Platform.MATTERMOST:
+            from gateway.platforms.mattermost import MattermostAdapter, check_mattermost_requirements
+            if not check_mattermost_requirements():
+                logger.warning("Mattermost: MATTERMOST_TOKEN or MATTERMOST_URL not set, or aiohttp missing")
+                return None
+            return MattermostAdapter(config)
 
         elif platform == Platform.MATRIX:
             from gateway.platforms.matrix import MatrixAdapter, check_matrix_requirements
@@ -6490,6 +6507,18 @@ class GatewayRunner:
             allow_bots_var = platform_allow_bots_map.get(source.platform)
             if allow_bots_var and os.getenv(allow_bots_var, "none").lower().strip() in {"mentions", "all"}:
                 return True
+
+        # Discord role-based access (DISCORD_ALLOWED_ROLES): the adapter's
+        # on_message pre-filter already verified role membership — if the
+        # message reached here, the user passed that check. Authorize
+        # directly to avoid the "no allowlists configured" branch below
+        # rejecting role-only setups where DISCORD_ALLOWED_USERS is empty
+        # (issue #7871).
+        if (
+            source.platform == Platform.DISCORD
+            and os.getenv("DISCORD_ALLOWED_ROLES", "").strip()
+        ):
+            return True
 
         # Check pairing store (always checked, regardless of allowlists)
         platform_name = source.platform.value if source.platform else ""
@@ -7209,6 +7238,8 @@ class GatewayRunner:
                     return await self._handle_help_command(event)
                 if _cmd_def_inner.name == "commands":
                     return await self._handle_commands_command(event)
+                if _cmd_def_inner.name == "note":
+                    return await self._handle_note_command(event)
                 if _cmd_def_inner.name == "profile":
                     return await self._handle_profile_command(event)
                 if _cmd_def_inner.name == "update":
@@ -7309,22 +7340,6 @@ class GatewayRunner:
                     logger.debug("PRIORITY steer for session %s", _quick_key)
                     return None
                 logger.debug("PRIORITY steer-fallback-to-queue for session %s", _quick_key)
-                self._queue_or_replace_pending_event(_quick_key, event)
-                return None
-            # #30170 — Subagent protection (PRIORITY path). Same rationale
-            # as ``_handle_active_session_busy_message``: an interrupt
-            # cascades through ``_active_children`` and aborts in-flight
-            # delegate_task work. Demote to queue semantics when the
-            # parent is currently driving subagents so a conversational
-            # follow-up doesn't destroy minutes of subagent progress.
-            # /stop reaches its dedicated handler above, so the operator
-            # still has a clean escape hatch.
-            if self._agent_has_active_subagents(running_agent):
-                logger.info(
-                    "PRIORITY interrupt demoted to queue for session %s "
-                    "because the running agent has active subagents (#30170)",
-                    _quick_key,
-                )
                 self._queue_or_replace_pending_event(_quick_key, event)
                 return None
             logger.debug("PRIORITY interrupt for session %s", _quick_key)
@@ -7594,6 +7609,9 @@ class GatewayRunner:
 
         if canonical == "voice":
             return await self._handle_voice_command(event)
+
+        if canonical == "note":
+            return await self._handle_note_command(event)
 
         if self._draining:
             return f"⏳ Gateway is {self._status_action_gerund()} and is not accepting new work right now."
@@ -8706,6 +8724,14 @@ class GatewayRunner:
             await self.hooks.emit("agent:start", hook_ctx)
 
             # Run the agent
+            effective_channel_prompt = event.channel_prompt
+            if source.platform == Platform.DISCORD and event.message_type == MessageType.VOICE:
+                live_voice_prompt = _discord_voice_fast_prompt()
+                if live_voice_prompt:
+                    effective_channel_prompt = (
+                        ((effective_channel_prompt or "").strip() + "\n\n" + live_voice_prompt).strip()
+                    )
+
             agent_result = await self._run_agent(
                 message=message_text,
                 context_prompt=context_prompt,
@@ -8715,7 +8741,9 @@ class GatewayRunner:
                 session_key=session_key,
                 run_generation=run_generation,
                 event_message_id=self._reply_anchor_for_event(event),
-                channel_prompt=event.channel_prompt,
+                channel_prompt=effective_channel_prompt,
+                low_latency_voice=(source.platform == Platform.DISCORD and event.message_type == MessageType.VOICE),
+                event=event,
             )
 
             # Stop persistent typing indicator now that the agent is done
@@ -8794,7 +8822,6 @@ class GatewayRunner:
             # session_entry so transcript writes below go to the right session.
             if agent_result.get("session_id") and agent_result["session_id"] != session_entry.session_id:
                 session_entry.session_id = agent_result["session_id"]
-                self.session_store._save()
 
             # Prepend reasoning/thinking if display is enabled (per-platform)
             try:
@@ -9047,7 +9074,16 @@ class GatewayRunner:
 
             # Auto voice reply: send TTS audio before the text response
             _already_sent = bool(agent_result.get("already_sent"))
-            if self._should_send_voice_reply(event, response, agent_messages, already_sent=_already_sent):
+            _voice_pipeline_audio_sent = bool(agent_result.get("voice_pipeline_audio_sent"))
+            _voice_pipeline_tts_attempted = bool(agent_result.get("voice_pipeline_tts_attempted"))
+            if self._should_send_voice_reply(
+                event,
+                response,
+                agent_messages,
+                already_sent=_already_sent,
+                voice_pipeline_audio_sent=_voice_pipeline_audio_sent,
+                voice_pipeline_tts_attempted=_voice_pipeline_tts_attempted,
+            ):
                 await self._send_voice_reply(event, response)
 
             # If streaming already delivered the response, extract and
@@ -10141,6 +10177,25 @@ class GatewayRunner:
             getattr(getattr(event, "source", None), "platform", None),
         )
 
+    async def _handle_note_command(self, event: MessageEvent) -> str:
+        """Append text to an existing Obsidian Markdown note."""
+        from gateway.obsidian_notes import (
+            ObsidianNoteError,
+            append_to_existing_note,
+            parse_note_command_args,
+        )
+
+        try:
+            request = parse_note_command_args(event.get_command_args())
+            note_path = await asyncio.to_thread(append_to_existing_note, request)
+        except ObsidianNoteError as exc:
+            return f"Note append failed: {exc}"
+        except Exception as exc:
+            logger.warning("Obsidian note append failed: %s", exc, exc_info=True)
+            return "Note append failed. Check gateway logs for details."
+
+        return f"Appended to Obsidian note `{note_path.stem}`."
+
     async def _handle_model_command(self, event: MessageEvent) -> Optional[str]:
         """Handle /model command — switch model for this session.
 
@@ -10436,21 +10491,7 @@ class GatewayRunner:
                         cfg = yaml.safe_load(f) or {}
                 else:
                     cfg = {}
-                # Coerce scalar/None ``model:`` into a dict before mutation —
-                # otherwise ``cfg.setdefault("model", {})`` returns the existing
-                # scalar and the next assignment raises
-                # ``TypeError: 'str' object does not support item assignment``.
-                # Reproduces when ``config.yaml`` has ``model: <name>`` (flat
-                # string) instead of the proper nested ``model: {default: ...}``.
-                raw_model = cfg.get("model")
-                if isinstance(raw_model, dict):
-                    model_cfg = raw_model
-                elif isinstance(raw_model, str) and raw_model.strip():
-                    model_cfg = {"default": raw_model.strip()}
-                    cfg["model"] = model_cfg
-                else:
-                    model_cfg = {}
-                    cfg["model"] = model_cfg
+                model_cfg = cfg.setdefault("model", {})
                 model_cfg["default"] = result.new_model
                 model_cfg["provider"] = result.target_provider
                 if result.base_url:
@@ -11168,7 +11209,12 @@ class GatewayRunner:
         return "Failed to join voice channel. Check bot permissions (Connect + Speak)."
 
     async def _handle_voice_channel_leave(self, event: MessageEvent) -> str:
-        """Leave the Discord voice channel."""
+        """Leave the Discord voice channel.
+
+        Only disconnects from VC and clears voice callbacks.
+        Does NOT modify voice mode — text replies remain available after
+        leaving VC.  Use explicit ``/voice off`` to disable TTS.
+        """
         adapter = self.adapters.get(event.source.platform)
         guild_id = self._get_guild_id(event)
 
@@ -11182,10 +11228,8 @@ class GatewayRunner:
             await adapter.leave_voice_channel(guild_id)
         except Exception as e:
             logger.warning("Error leaving voice channel: %s", e)
-        # Always clean up state even if leave raised an exception
-        self._voice_mode[self._voice_key(event.source.platform, event.source.chat_id)] = "off"
-        self._save_voice_modes()
-        self._set_adapter_auto_tts_disabled(adapter, event.source.chat_id, disabled=True)
+        # Clear voice callbacks; do NOT touch voice_mode — text replies
+        # and TTS on other platforms are independent of VC state.
         if hasattr(adapter, "_voice_input_callback"):
             adapter._voice_input_callback = None
         return "Left voice channel."
@@ -11193,12 +11237,35 @@ class GatewayRunner:
     def _handle_voice_timeout_cleanup(self, chat_id: str) -> None:
         """Called by the adapter when a voice channel times out.
 
-        Cleans up runner-side voice_mode state that the adapter cannot reach.
+        Clears adapter-side voice state only.  Does NOT touch voice_mode
+        or adapter auto-TTS so that text replies and other platforms remain
+        fully available after a VC disconnect.
         """
-        self._voice_mode[self._voice_key(Platform.DISCORD, chat_id)] = "off"
-        self._save_voice_modes()
-        adapter = self.adapters.get(Platform.DISCORD)
-        self._set_adapter_auto_tts_disabled(adapter, chat_id, disabled=True)
+        logger.info(
+            "Voice channel disconnected (timeout) for chat %s — "
+            "text replies remain available; use /voice off to disable TTS",
+            chat_id,
+        )
+
+        # === Orpheus voice post-disconnect analysis (orpheusab profile) ===
+        try:
+            import os
+            import subprocess
+            script = "/home/kayai3/.hermes/profiles/orpheusab/scripts/analyze_on_disconnect.sh"
+            if os.path.exists(script) and os.access(script, os.X_OK):
+                logger.info("Launching Orpheus voice analyzer for chat %s", chat_id)
+                p = subprocess.Popen(
+                    [script, str(chat_id)],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+                out, err = p.communicate(timeout=15)
+                if out or err:
+                    logger.info("Analyzer output: %s", (out + err).decode()[:200])
+            else:
+                logger.warning("Analyzer script missing or not executable: %s", script)
+        except Exception:
+            logger.exception("Voice post-disconnect analyzer failed")
 
     def _is_duplicate_voice_transcript(self, guild_id: int, user_id: int, transcript: str) -> bool:
         """Suppress repeated STT outputs for the same recent utterance.
@@ -11241,6 +11308,205 @@ class GatewayRunner:
         recent_store[key] = recent[-5:]
         return False
 
+    @staticmethod
+    def _spoken_number_1_to_100(value: int) -> str:
+        small = [
+            "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
+            "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen", "seventeen",
+            "eighteen", "nineteen",
+        ]
+        tens = ["", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety"]
+        if value == 100:
+            return "one hundred"
+        if 0 <= value < 20:
+            return small[value]
+        ten, one = divmod(value, 10)
+        return tens[ten] if one == 0 else f"{tens[ten]} {small[one]}"
+
+    @classmethod
+    def _deterministic_count_target(cls, transcript: str) -> Optional[int]:
+        """Return target N for simple voice requests like 'count to 100'.
+
+        Counting is a deterministic task and the Orpheus voice path is sensitive
+        to provider truncation/stream errors. Bypass the LLM for this narrow
+        request so Discord VC can reliably speak the full count.
+        """
+        normalized = re.sub(r"[^a-z0-9\s]", " ", str(transcript or "").lower())
+        normalized = re.sub(r"\s+", " ", normalized).strip()
+        # STT often drops small connector words around short voice commands
+        # ("count 100", "can you count one hundred", etc.). Treat any simple
+        # count+100 utterance as count-up-to-100 unless it explicitly asks to
+        # count down/backwards.
+        if "count" in normalized and re.search(r"\b(?:100|one hundred|hundred)\b", normalized):
+            if not re.search(r"\b(?:down|backward|backwards|reverse|descending)\b", normalized):
+                return 100
+
+        # Local STT can hear the short command "count to 100" as "talk to 100".
+        # In live voice this phrase has no useful non-count interpretation, so
+        # route it through the deterministic count path instead of the LLM.
+        if re.fullmatch(r"talk\s+(?:to\s+)?(?:100|one\s+hundred|hundred)", normalized):
+            return 100
+
+        range_match = re.search(r"\bcount\s+(?:one|1)\s+(?:to|through|until)\s+(one\s+hundred|hundred|\d{1,3})\b", normalized)
+        if range_match:
+            raw_target = range_match.group(1)
+            if raw_target in {"one hundred", "hundred"}:
+                target = 100
+            else:
+                try:
+                    target = int(raw_target)
+                except ValueError:
+                    return None
+            return target if 1 <= target <= 100 else None
+
+        match = re.search(
+            r"\bcount(?:\s+up)?(?:\s+from\s+(?:one|1))?\s+(?:to|through|until)?\s*(one\s+hundred|hundred|\d{1,3})\b",
+            normalized,
+        )
+        if not match:
+            return None
+        raw_target = match.group(1)
+        if raw_target in {"one hundred", "hundred"}:
+            target = 100
+        else:
+            try:
+                target = int(raw_target)
+            except ValueError:
+                return None
+        if not 1 <= target <= 100:
+            return None
+        return target
+
+    @classmethod
+    def _deterministic_count_chunks(cls, transcript: str) -> Optional[List[str]]:
+        target = cls._deterministic_count_target(transcript)
+        if target is None:
+            return None
+        # Orpheus can loop even on two compound spoken numbers such as
+        # "twenty three, twenty four". Keep deterministic count chunks to one
+        # spoken number so count requests prioritize reliability over cadence.
+        group_size = 1
+        items = [cls._spoken_number_1_to_100(i) for i in range(1, target + 1)]
+        chunks: List[str] = []
+        for start in range(0, len(items), group_size):
+            end = min(start + group_size, len(items))
+            suffix = "." if end == len(items) else ","
+            chunks.append(", ".join(items[start:end]) + suffix)
+        return chunks
+
+    @classmethod
+    def _deterministic_count_response(cls, transcript: str) -> Optional[str]:
+        target = cls._deterministic_count_target(transcript)
+        if target is None:
+            return None
+        parts = [cls._spoken_number_1_to_100(i) for i in range(1, target + 1)]
+        return ", ".join(parts) + "."
+
+    _ORPHEUS_VOICES = ("tara", "leah", "jess", "leo", "dan", "mia", "zac", "zoe", "julia")
+
+    @classmethod
+    def _orpheus_voice_command_response(cls, transcript: str) -> Optional[str]:
+        """Return a direct response for simple Orpheus voice-management commands."""
+        normalized = re.sub(r"[^a-z0-9\s]", " ", str(transcript or "").lower())
+        normalized = re.sub(r"\s+", " ", normalized).strip()
+        if not normalized:
+            return None
+
+        if re.fullmatch(r"(?:list|show|tell me|what are)(?: all)?(?: the)?(?:(?:orpheus|persephone))? voices", normalized):
+            return "Available Persephone voices are: " + ", ".join(cls._ORPHEUS_VOICES) + "."
+
+        match = re.search(
+            r"\b(?:switch|change|set)(?:\s+(?:(?:orpheus|persephone)\s+)?voice)?\s+to\s+([a-z0-9_ -]+)\b",
+            normalized,
+        )
+        if not match:
+            return None
+
+        requested = match.group(1).strip().replace(" ", "_")
+        if requested not in cls._ORPHEUS_VOICES:
+            return (
+                f"I don't know the Persephone voice {requested.replace('_', ' ')}. "
+                "Available voices are: " + ", ".join(cls._ORPHEUS_VOICES) + "."
+            )
+
+        config_path = _hermes_home / "config.yaml"
+        try:
+            import yaml as _yaml
+
+            with open(config_path, encoding="utf-8") as f:
+                config = _yaml.safe_load(f) or {}
+            if not isinstance(config, dict):
+                config = {}
+            tts_config = config.setdefault("tts", {})
+            if not isinstance(tts_config, dict):
+                tts_config = {}
+                config["tts"] = tts_config
+            orpheus_config = tts_config.setdefault("orpheus", {})
+            if not isinstance(orpheus_config, dict):
+                orpheus_config = {}
+                tts_config["orpheus"] = orpheus_config
+            orpheus_config["voice"] = requested
+            atomic_yaml_write(config_path, config, sort_keys=False)
+        except Exception as exc:
+            logger.warning("Failed to update Persephone voice in config: %s", exc, exc_info=True)
+            return f"I couldn't switch Persephone to {requested}."
+
+        return f"Switched Persephone voice to {requested}."
+
+    async def _obsidian_note_voice_response(self, transcript: str) -> Optional[str]:
+        """Append spoken note text directly instead of sending it through the LLM."""
+        from gateway.obsidian_notes import (
+            ObsidianNoteError,
+            append_to_existing_note,
+            parse_spoken_note_append,
+        )
+
+        try:
+            request = parse_spoken_note_append(transcript)
+            if request is None:
+                return None
+            note_path = await asyncio.to_thread(append_to_existing_note, request)
+        except ObsidianNoteError as exc:
+            return f"I couldn't append that note. {exc}"
+        except Exception as exc:
+            logger.warning("Obsidian voice note append failed: %s", exc, exc_info=True)
+            return "I couldn't append that note. Check the gateway logs."
+
+        return f"Appended to {note_path.stem}."
+
+    async def _speak_direct_voice_text(
+        self,
+        adapter: Any,
+        guild_id: int,
+        text: str,
+        chunks: Optional[List[str]] = None,
+    ) -> bool:
+        """Speak precomputed text through the Discord voice pipeline."""
+        try:
+            from gateway.voice_pipeline import DiscordVoicePipeline
+
+            pipeline = DiscordVoicePipeline(
+                adapter=adapter,
+                guild_id=guild_id,
+                max_chars=self._discord_streaming_tts_max_chars(),
+                target_words=self._discord_streaming_tts_target_words(),
+                tts_provider_override=os.getenv("HERMES_DISCORD_VOICE_TTS_PROVIDER", "").strip() or None,
+                loop=asyncio.get_running_loop(),
+                numeric_list_target=self._discord_streaming_tts_numeric_list_target(),
+                min_chunk_words=self._discord_streaming_tts_min_chunk_words(),
+            )
+            pipeline.start()
+            if chunks:
+                pipeline.feed_chunks(chunks)
+            else:
+                pipeline.feed(text)
+            pipeline.flush()
+            await pipeline.close()
+            return bool(pipeline.delivered_any)
+        except Exception as exc:
+            logger.warning("Direct Discord voice response failed: %s", exc, exc_info=True)
+            return False
+
     async def _handle_voice_channel_input(
         self, guild_id: int, user_id: int, transcript: str
     ):
@@ -11278,6 +11544,20 @@ class GatewayRunner:
             logger.debug("Unauthorized voice input from user %d, ignoring", user_id)
             return
 
+        if _discord_voice_wake_enabled():
+            wake_names = _discord_voice_wake_names(adapter)
+            woken_transcript = _strip_discord_voice_wake_phrase(transcript, wake_names)
+            if woken_transcript is None:
+                logger.info(
+                    "Discord voice input ignored without wake phrase: guild=%s user=%s names=%s transcript=%r",
+                    guild_id,
+                    user_id,
+                    wake_names,
+                    transcript[:160],
+                )
+                return
+            transcript = woken_transcript
+
         if self._is_duplicate_voice_transcript(guild_id, user_id, transcript):
             logger.info(
                 "Suppressing duplicate voice transcript for guild=%s user=%s: %s",
@@ -11286,6 +11566,32 @@ class GatewayRunner:
                 transcript[:100],
             )
             return
+
+        # Optional instant spoken acknowledgement for live VC.  Keep this OFF
+        # by default: generic canned clips ("yep", "got it", etc.) compete with
+        # contextual low-latency voice replies and feel wrong for coaching-style
+        # conversations.  Operators who explicitly want this must enable it and
+        # provide an ack clip path.
+        if os.getenv("HERMES_DISCORD_VOICE_INSTANT_ACK", "false").strip().lower() in {"1", "true", "yes", "on"}:
+            ack_path = os.getenv("HERMES_DISCORD_VOICE_ACK_PATH", "").strip()
+            raw_play_in_voice = getattr(adapter, "play_in_voice_channel", None)
+            if ack_path and os.path.exists(ack_path) and callable(raw_play_in_voice):
+                try:
+                    from typing import Awaitable, Callable, cast
+                    play_in_voice = cast(Callable[[int, str], Awaitable[bool]], raw_play_in_voice)
+
+                    async def _play_instant_ack() -> None:
+                        await play_in_voice(guild_id, ack_path)
+
+                    asyncio.create_task(_play_instant_ack())
+                    logger.info(
+                        "Discord voice latency: instant_ack_scheduled guild=%d user=%d path=%s",
+                        guild_id,
+                        user_id,
+                        ack_path,
+                    )
+                except Exception as e:
+                    logger.debug("Discord voice instant ack scheduling failed: %s", e)
 
         # Show transcript in text channel (after auth, with mention sanitization)
         try:
@@ -11296,15 +11602,88 @@ class GatewayRunner:
         except Exception:
             pass
 
-        # Build a synthetic MessageEvent and feed through the normal pipeline
+        direct_count_chunks = self._deterministic_count_chunks(transcript)
+        if direct_count_chunks:
+            direct_count_text = " ".join(direct_count_chunks)
+            logger.info(
+                "Discord voice deterministic count response: guild=%s user=%s chunks=%d chars=%d transcript=%r",
+                guild_id,
+                user_id,
+                len(direct_count_chunks),
+                len(direct_count_text),
+                transcript[:160],
+            )
+            spoken = await self._speak_direct_voice_text(
+                adapter,
+                guild_id,
+                direct_count_text,
+                chunks=direct_count_chunks,
+            )
+            if not spoken:
+                try:
+                    channel = adapter._client.get_channel(text_ch_id)
+                    if channel:
+                        await channel.send(direct_count_text[:2000])
+                except Exception:
+                    pass
+            return
+
+        orpheus_voice_response = self._orpheus_voice_command_response(transcript)
+        if orpheus_voice_response:
+            logger.info(
+                "Discord voice Persephone voice command: guild=%s user=%s response=%r transcript=%r",
+                guild_id,
+                user_id,
+                orpheus_voice_response[:160],
+                transcript[:160],
+            )
+            spoken = await self._speak_direct_voice_text(adapter, guild_id, orpheus_voice_response)
+            if not spoken:
+                try:
+                    channel = adapter._client.get_channel(text_ch_id)
+                    if channel:
+                        await channel.send(orpheus_voice_response[:2000])
+                except Exception:
+                    pass
+            return
+
+        obsidian_note_response = await self._obsidian_note_voice_response(transcript)
+        if obsidian_note_response:
+            logger.info(
+                "Discord voice Obsidian note command: guild=%s user=%s response=%r transcript=%r",
+                guild_id,
+                user_id,
+                obsidian_note_response[:160],
+                transcript[:160],
+            )
+            spoken = await self._speak_direct_voice_text(adapter, guild_id, obsidian_note_response)
+            if not spoken:
+                try:
+                    channel = adapter._client.get_channel(text_ch_id)
+                    if channel:
+                        await channel.send(obsidian_note_response[:2000])
+                except Exception:
+                    pass
+            return
+
+        # Build a synthetic MessageEvent and feed through the normal pipeline.
         # Use SimpleNamespace as raw_message so _get_guild_id() can extract
         # guild_id and _send_voice_reply() plays audio in the voice channel.
+        # A small per-event prompt keeps live voice snappy without changing
+        # normal Discord text, Telegram, or tool-heavy Hermes behavior.
         from types import SimpleNamespace
+        live_voice_prompt = ""
+        if os.getenv("HERMES_DISCORD_VOICE_BREVITY", "true").strip().lower() not in {"0", "false", "no", "off"}:
+            live_voice_prompt = os.getenv("HERMES_DISCORD_VOICE_BREVITY_PROMPT", "").strip()
+            if not live_voice_prompt:
+                live_voice_prompt = _discord_voice_fast_prompt()
+
         event = MessageEvent(
             source=source,
             text=transcript,
             message_type=MessageType.VOICE,
             raw_message=SimpleNamespace(guild_id=guild_id, guild=None),
+            channel_prompt=live_voice_prompt or None,
         )
 
         await adapter.handle_message(event)
@@ -11315,6 +11694,8 @@ class GatewayRunner:
         response: str,
         agent_messages: list,
         already_sent: bool = False,
+        voice_pipeline_audio_sent: bool = False,
+        voice_pipeline_tts_attempted: bool = False,
     ) -> bool:
         """Decide whether the runner should send a TTS voice reply.
 
@@ -11322,11 +11703,16 @@ class GatewayRunner:
         - voice_mode is off for this chat
         - response is empty or an error
         - agent already called text_to_speech tool (dedup)
+        - the Discord streaming voice pipeline already spoke the response
+        - the Discord streaming voice pipeline attempted TTS for this turn
+          (even if no chunk successfully played — prevents legacy fallback)
         - voice input and base adapter auto-TTS already handled it (skip_double)
           UNLESS streaming already consumed the response (already_sent=True),
           in which case the base adapter won't have text for auto-TTS so the
           runner must handle it.
         """
+        if voice_pipeline_audio_sent or voice_pipeline_tts_attempted:
+            return False
         if not response or response.startswith("Error:"):
             return False
 
@@ -11363,6 +11749,222 @@ class GatewayRunner:
 
         return True
 
+    def _discord_streaming_tts_enabled(self) -> bool:
+        raw = os.getenv("HERMES_DISCORD_VOICE_STREAMING_TTS", "false")
+        return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+    def _discord_streaming_tts_max_chars(self) -> int:
+        raw = os.getenv("HERMES_DISCORD_VOICE_STREAMING_MAX_CHARS", "140")
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            logger.warning("Invalid HERMES_DISCORD_VOICE_STREAMING_MAX_CHARS=%r; using 140", raw)
+            return 140
+        return max(40, min(value, 400))
+
+    def _discord_streaming_tts_target_words(self) -> int:
+        raw = os.getenv("HERMES_DISCORD_VOICE_STREAMING_TARGET_WORDS", "0")
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            logger.warning("Invalid HERMES_DISCORD_VOICE_STREAMING_TARGET_WORDS=%r; disabled", raw)
+            return 0
+        return max(0, min(value, 80))
+
+    def _discord_streaming_tts_numeric_list_target(self) -> int:
+        raw = os.getenv("HERMES_DISCORD_VOICE_STREAMING_NUMERIC_LIST_TARGET", "3")
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            logger.warning("Invalid HERMES_DISCORD_VOICE_STREAMING_NUMERIC_LIST_TARGET=%r; using 3", raw)
+            return 3
+        return max(1, value)
+
+    def _discord_streaming_tts_min_chunk_words(self) -> int:
+        raw = os.getenv("HERMES_DISCORD_VOICE_STREAMING_MIN_CHUNK_WORDS", "0")
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            logger.warning("Invalid HERMES_DISCORD_VOICE_STREAMING_MIN_CHUNK_WORDS=%r; disabled", raw)
+            return 0
+        return max(0, min(value, 80))
+
+    def _discord_voice_pipeline_final_only(self) -> bool:
+        raw = os.getenv("HERMES_DISCORD_VOICE_PIPELINE_FINAL_ONLY", "false")
+        return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+    def _split_streaming_tts_chunks(self, text: str, max_chars: Optional[int] = None) -> List[str]:
+        """Split spoken text into short phrase chunks for low-latency TTS."""
+        max_chars = max_chars or self._discord_streaming_tts_max_chars()
+        normalized = re.sub(r"\s+", " ", text).strip()
+        if not normalized:
+            return []
+
+        try:
+            from gateway.voice_pipeline import TextChunker
+
+            chunker = TextChunker(
+                max_chars=max_chars,
+                target_words=self._discord_streaming_tts_target_words(),
+                numeric_list_target=self._discord_streaming_tts_numeric_list_target(),
+                min_chunk_words=self._discord_streaming_tts_min_chunk_words(),
+            )
+            chunks = chunker.feed(normalized)
+            chunks.extend(chunker.flush())
+            if chunks:
+                return chunks
+        except Exception as exc:
+            logger.debug("Falling back to legacy streaming TTS chunk splitter: %s", exc)
+
+        # Keep punctuation with the phrase.  This favors natural prosody and
+        # gives Orpheus short enough requests to produce first audio quickly.
+        pieces = re.split(r"(?<=[.!?;:])\s+", normalized)
+        chunks: List[str] = []
+        current = ""
+        for piece in pieces:
+            piece = piece.strip()
+            if not piece:
+                continue
+            while len(piece) > max_chars:
+                split_at = piece.rfind(" ", 0, max_chars)
+                if split_at < max(20, max_chars // 3):
+                    split_at = max_chars
+                head = piece[:split_at].strip()
+                piece = piece[split_at:].strip()
+                if current:
+                    chunks.append(current)
+                    current = ""
+                if head:
+                    chunks.append(head)
+            if not piece:
+                continue
+            candidate = f"{current} {piece}".strip() if current else piece
+            if len(candidate) <= max_chars:
+                current = candidate
+            else:
+                if current:
+                    chunks.append(current)
+                current = piece
+        if current:
+            chunks.append(current)
+        return chunks
+
+    async def _send_streaming_voice_reply(
+        self,
+        event: MessageEvent,
+        text: str,
+        adapter: Any,
+        guild_id: int,
+    ) -> bool:
+        """Phrase-stream Discord VC TTS while later chunks are still generating."""
+        if not hasattr(adapter, "play_audio_sequence_in_voice_channel"):
+            return False
+
+        from tools.tts_tool import text_to_speech_tool, _strip_markdown_for_tts
+
+        tts_text = _strip_markdown_for_tts(text[:4000])
+        chunks = self._split_streaming_tts_chunks(tts_text)
+        if not chunks:
+            return False
+
+        started_at = time.monotonic()
+        queue: asyncio.Queue[Optional[str]] = asyncio.Queue(maxsize=2)
+        generated_paths: List[str] = []
+        producer_error: List[BaseException] = []
+        first_chunk_generated_at: Optional[float] = None
+
+        async def _producer() -> None:
+            nonlocal first_chunk_generated_at
+            try:
+                for idx, chunk in enumerate(chunks, start=1):
+                    audio_path = os.path.join(
+                        tempfile.gettempdir(),
+                        "hermes_voice",
+                        f"tts_stream_{int(started_at * 1000)}_{idx}.mp3",
+                    )
+                    os.makedirs(os.path.dirname(audio_path), exist_ok=True)
+                    chunk_started = time.monotonic()
+                    result_json = await asyncio.to_thread(
+                        text_to_speech_tool,
+                        text=chunk,
+                        output_path=audio_path,
+                    )
+                    result = json.loads(result_json)
+                    actual_path = result.get("file_path", audio_path)
+                    if not result.get("success") or not os.path.isfile(actual_path):
+                        raise RuntimeError(result.get("error") or "streaming TTS chunk failed")
+                    generated_paths.append(actual_path)
+                    if first_chunk_generated_at is None:
+                        first_chunk_generated_at = time.monotonic()
+                        logger.info(
+                            "Discord voice streaming TTS: first chunk generated in %.2fs (chunks=%d)",
+                            first_chunk_generated_at - started_at,
+                            len(chunks),
+                        )
+                    else:
+                        logger.info(
+                            "Discord voice streaming TTS: chunk %d/%d generated in %.2fs",
+                            idx,
+                            len(chunks),
+                            time.monotonic() - chunk_started,
+                        )
+                    await queue.put(actual_path)
+            except Exception as exc:
+                producer_error.append(exc)
+                logger.warning("Discord voice streaming TTS producer failed: %s", exc, exc_info=True)
+            finally:
+                await queue.put(None)
+
+        async def _paths() -> AsyncIterator[str]:
+            while True:
+                item = await queue.get()
+                if item is None:
+                    break
+                yield item
+
+        producer_task = asyncio.create_task(_producer())
+        try:
+            logger.info(
+                "Discord voice streaming TTS: starting phrase-level stream chunks=%d max_chars=%d",
+                len(chunks),
+                self._discord_streaming_tts_max_chars(),
+            )
+            played = await adapter.play_audio_sequence_in_voice_channel(guild_id, _paths())
+            if not producer_task.done():
+                producer_task.cancel()
+                try:
+                    await producer_task
+                except asyncio.CancelledError:
+                    pass
+            else:
+                await producer_task
+            total = time.monotonic() - started_at
+            if played:
+                first_audio = (first_chunk_generated_at - started_at) if first_chunk_generated_at else None
+                logger.info(
+                    "Discord voice streaming TTS complete: chunks=%d first_audio_ready=%s total=%.2fs",
+                    len(chunks),
+                    f"{first_audio:.2f}s" if first_audio is not None else "unknown",
+                    total,
+                )
+                return True
+            if producer_error:
+                logger.warning("Discord voice streaming TTS produced no playback; falling back to batch TTS")
+            return False
+        except Exception as exc:
+            logger.warning("Discord voice streaming TTS failed; falling back to batch TTS: %s", exc, exc_info=True)
+            if not producer_task.done():
+                producer_task.cancel()
+            return False
+        finally:
+            if not producer_task.done():
+                producer_task.cancel()
+            for path in generated_paths:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+
     async def _send_voice_reply(self, event: MessageEvent, text: str) -> None:
         """Generate TTS audio and send as a voice message before the text reply."""
         import uuid as _uuid
@@ -11374,6 +11976,22 @@ class GatewayRunner:
             tts_text = _strip_markdown_for_tts(text[:4000])
             if not tts_text:
                 return
+
+            adapter = self.adapters.get(event.source.platform)
+            guild_id = self._get_guild_id(event)
+            is_in_voice_channel = getattr(adapter, "is_in_voice_channel", None) if adapter else None
+            if (
+                event.source.platform == Platform.DISCORD
+                and guild_id
+                and adapter
+                and self._discord_streaming_tts_enabled()
+                and callable(is_in_voice_channel)
+                and is_in_voice_channel(guild_id)
+                and hasattr(adapter, "play_audio_sequence_in_voice_channel")
+            ):
+                streamed = await self._send_streaming_voice_reply(event, tts_text, adapter, guild_id)
+                if streamed:
+                    return
 
             # Use .mp3 extension so edge-tts conversion to opus works correctly.
             # The TTS tool may convert to .ogg — use file_path from result.
@@ -12851,7 +13469,7 @@ class GatewayRunner:
                 return t("gateway.title.current_no_title", session_id=session_id)
 
     async def _handle_resume_command(self, event: MessageEvent) -> str:
-        """Handle /resume command — list or switch to a previous session."""
+        """Handle /resume command — switch to a previously-named session."""
         if not self._session_db:
             from hermes_state import format_session_db_unavailable
             return format_session_db_unavailable(prefix=t("gateway.shared.session_db_unavailable_prefix"))
@@ -12860,60 +13478,30 @@ class GatewayRunner:
         session_key = self._session_key_for_source(source)
         name = event.get_command_args().strip()
 
-        # Strip common outer brackets/quotes users may type literally from the
-        # usage hint (e.g. ``/resume <abc123>``). Mirrors the CLI behavior.
-        if len(name) >= 2 and (
-            (name[0] == "<" and name[-1] == ">")
-            or (name[0] == "[" and name[-1] == "]")
-            or (name[0] == '"' and name[-1] == '"')
-            or (name[0] == "'" and name[-1] == "'")
-        ):
-            name = name[1:-1].strip()
-
-        def _list_titled_sessions() -> list[dict]:
-            user_source = source.platform.value if source.platform else None
-            sessions = self._session_db.list_sessions_rich(source=user_source, limit=10)
-            return [s for s in sessions if s.get("title")][:10]
-
         if not name:
             # List recent titled sessions for this user/platform
             try:
-                titled = _list_titled_sessions()
+                user_source = source.platform.value if source.platform else None
+                sessions = self._session_db.list_sessions_rich(
+                    source=user_source, limit=10
+                )
+                titled = [s for s in sessions if s.get("title")]
                 if not titled:
                     return t("gateway.resume.no_named_sessions")
                 lines = [t("gateway.resume.list_header")]
-                for idx, s in enumerate(titled[:10], start=1):
+                for s in titled[:10]:
                     title = s["title"]
                     preview = s.get("preview", "")[:40]
                     preview_part = t("gateway.resume.list_preview_suffix", preview=preview) if preview else ""
-                    lines.append(t("gateway.resume.list_item_numbered", index=idx, title=title, preview_part=preview_part))
-                lines.append(t("gateway.resume.list_footer_numbered"))
+                    lines.append(t("gateway.resume.list_item", title=title, preview_part=preview_part))
+                lines.append(t("gateway.resume.list_footer"))
                 return "\n".join(lines)
             except Exception as e:
                 logger.debug("Failed to list titled sessions: %s", e)
                 return t("gateway.resume.list_failed", error=e)
 
-        # Resolve a numbered choice or a title to a session ID.
-        if name.isdigit():
-            try:
-                titled = _list_titled_sessions()
-            except Exception as e:
-                logger.debug("Failed to list titled sessions for numeric resume: %s", e)
-                return t("gateway.resume.list_failed", error=e)
-            index = int(name)
-            if index < 1 or index > len(titled):
-                return t("gateway.resume.out_of_range", index=index)
-            target = titled[index - 1]
-            target_id = target.get("id")
-            name = target.get("title") or name
-        else:
-            # Try direct session ID lookup first (so `/resume <session_id>`
-            # works in the gateway, not just `/resume <title>`).
-            session = self._session_db.get_session(name)
-            if session:
-                target_id = session["id"]
-            else:
-                target_id = self._session_db.resolve_session_by_title(name)
+        # Resolve the name to a session ID.
+        target_id = self._session_db.resolve_session_by_title(name)
         if not target_id:
             return t("gateway.resume.not_found", name=name)
         # Compression creates child continuations that hold the live transcript.
@@ -13338,40 +13926,6 @@ class GatewayRunner:
                 lines.append(t("gateway.reload_mcp.none_connected"))
             else:
                 lines.append(t("gateway.reload_mcp.tools_available", tools=len(new_tools), servers=len(connected_servers)))
-
-            # Refresh cached agents so existing sessions see new MCP tools on
-            # their next turn — without this, the user has to `/new` (which
-            # discards conversation history) to pick up tools from a server
-            # that was just added or reconnected. The user has already
-            # consented to the prompt-cache invalidation via the slash-confirm
-            # gate in _handle_reload_mcp_command before we reach this point.
-            try:
-                from model_tools import get_tool_definitions
-                _cache = getattr(self, "_agent_cache", None)
-                _cache_lock = getattr(self, "_agent_cache_lock", None)
-                if _cache_lock is not None and _cache:
-                    with _cache_lock:
-                        for _sess_key, _entry in list(_cache.items()):
-                            try:
-                                _agent = _entry[0] if isinstance(_entry, tuple) else _entry
-                            except Exception:
-                                continue
-                            if _agent is None:
-                                continue
-                            new_defs = get_tool_definitions(
-                                enabled_toolsets=getattr(_agent, "enabled_toolsets", None),
-                                disabled_toolsets=getattr(_agent, "disabled_toolsets", None),
-                                quiet_mode=True,
-                            )
-                            _agent.tools = new_defs
-                            _agent.valid_tool_names = {
-                                t["function"]["name"] for t in new_defs
-                            } if new_defs else set()
-            except Exception as _exc:
-                logger.debug(
-                    "Failed to update cached agent tools after MCP reload: %s",
-                    _exc,
-                )
 
             # Inject a message at the END of the session history so the
             # model knows tools changed on its next turn.  Appended after
@@ -15772,6 +16326,8 @@ class GatewayRunner:
         _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None,
         channel_prompt: Optional[str] = None,
+        low_latency_voice: bool = False,
+        event: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -15814,9 +16370,22 @@ class GatewayRunner:
         agent_cfg_local = user_config.get("agent") or {}
         disabled_toolsets = agent_cfg_local.get("disabled_toolsets") or None
 
+        if low_latency_voice:
+            voice_toolsets = os.getenv("HERMES_DISCORD_VOICE_TOOLSETS", "").strip()
+            if voice_toolsets:
+                enabled_toolsets = [item.strip() for item in voice_toolsets.split(",") if item.strip()]
+            elif os.getenv("HERMES_DISCORD_VOICE_ENABLE_TOOLS", "false").strip().lower() not in {"1", "true", "yes", "on"}:
+                # Live voice has a much tighter latency budget than normal
+                # gateway turns. Tool schemas are large and encourage the
+                # model to deliberate/tool-call; default to a no-tools
+                # conversational turn unless explicitly opted in.
+                enabled_toolsets = []
+
         display_config = user_config.get("display", {})
         if not isinstance(display_config, dict):
             display_config = {}
+
+        agent_loop = asyncio.get_running_loop()
 
         # Per-platform display settings — resolve via display_config module
         # which checks display.platforms.<platform>.<key> first, then
@@ -16447,6 +17016,8 @@ class GatewayRunner:
                         _cleanup_msg_ids.append(str(mid))
                 _fut.add_done_callback(_track_status_id)
 
+        pipeline = None
+
         def run_sync():
             # The conditional re-assignment of `message` further below
             # (prepending model-switch notes) makes Python treat it as a
@@ -16454,14 +17025,24 @@ class GatewayRunner:
             # read *and* reassign the outer `_run_agent` parameter without
             # triggering an UnboundLocalError on the earlier read at
             # `_resolve_turn_agent_config(message, …)`.
-            nonlocal message
+            nonlocal message, pipeline
 
             # session_key is now set via contextvars in _set_session_env()
             # (concurrency-safe). Keep os.environ as fallback for CLI/cron.
             os.environ["HERMES_SESSION_KEY"] = session_key or ""
 
+            # Re-read .env and config for fresh credentials (gateway is long-lived,
+            # keys may change without restart). Keep config.yaml authoritative for
+            # runtime budget settings bridged into env vars.
+            _reload_runtime_env_preserving_config_authority()
+
             # Read from env var or use default (same as CLI)
             max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
+            if low_latency_voice:
+                try:
+                    max_iterations = int(os.getenv("HERMES_DISCORD_VOICE_MAX_ITERATIONS", "2"))
+                except ValueError:
+                    max_iterations = 2
             
             # Map platform enum to the platform hint key the agent understands.
             # Platform.LOCAL ("local") maps to "cli"; others pass through as-is.
@@ -16476,17 +17057,34 @@ class GatewayRunner:
             if self._ephemeral_system_prompt:
                 combined_ephemeral = (combined_ephemeral + "\n\n" + self._ephemeral_system_prompt).strip()
 
-            # Re-read .env and config for fresh credentials (gateway is long-lived,
-            # keys may change without restart). Keep config.yaml authoritative for
-            # runtime budget settings bridged into env vars.
-            _reload_runtime_env_preserving_config_authority()
-
             try:
                 model, runtime_kwargs = self._resolve_session_agent_runtime(
                     source=source,
                     session_key=session_key,
                     user_config=user_config,
                 )
+                if low_latency_voice:
+                    voice_provider = _discord_voice_provider()
+                    voice_model = _discord_voice_model()
+                    from hermes_cli.runtime_provider import resolve_runtime_provider
+                    voice_runtime = resolve_runtime_provider(requested=voice_provider)
+                    runtime_kwargs.update({
+                        "api_key": voice_runtime.get("api_key"),
+                        "base_url": voice_runtime.get("base_url"),
+                        "provider": voice_runtime.get("provider"),
+                        "api_mode": voice_runtime.get("api_mode"),
+                        "command": voice_runtime.get("command"),
+                        "args": list(voice_runtime.get("args") or []),
+                        "credential_pool": voice_runtime.get("credential_pool"),
+                    })
+                    model = voice_model
+                    logger.info(
+                        "Discord voice low-latency route: model=%s provider=%s tools=%s max_iterations=%s",
+                        model,
+                        runtime_kwargs.get("provider"),
+                        enabled_toolsets or [],
+                        max_iterations,
+                    )
                 logger.debug(
                     "run_agent resolved: model=%s provider=%s session=%s",
                     model, runtime_kwargs.get("provider"), session_key or "",
@@ -16509,6 +17107,32 @@ class GatewayRunner:
             # Set up stream consumer for token streaming or interim commentary.
             _stream_consumer = None
             _stream_delta_cb = None
+
+            pipeline = None
+            pipeline_final_only = False
+            if (
+                source.platform == Platform.DISCORD
+                and low_latency_voice
+                and os.getenv("HERMES_DISCORD_VOICE_PIPELINE_TTS", "false").strip().lower() in {"1", "true", "yes", "on"}
+            ):
+                adapter = self.adapters.get(Platform.DISCORD)
+                guild_id = self._get_guild_id(event) if event else None
+                if adapter and guild_id:
+                    voice_provider = os.getenv("HERMES_DISCORD_VOICE_TTS_PROVIDER", "").strip()
+                    pipeline_final_only = self._discord_voice_pipeline_final_only()
+                    from gateway.voice_pipeline import DiscordVoicePipeline
+                    pipeline = DiscordVoicePipeline(
+                        adapter=adapter,
+                        guild_id=guild_id,
+                        max_chars=self._discord_streaming_tts_max_chars(),
+                        target_words=self._discord_streaming_tts_target_words(),
+                        tts_provider_override=voice_provider or None,
+                        loop=agent_loop,
+                        numeric_list_target=self._discord_streaming_tts_numeric_list_target(),
+                        min_chunk_words=self._discord_streaming_tts_min_chunk_words(),
+                    )
+                    setattr(pipeline, "final_only", pipeline_final_only)
+                    pipeline.start()
             _scfg = getattr(getattr(self, 'config', None), 'streaming', None)
             if _scfg is None:
                 from gateway.config import StreamingConfig
@@ -16588,6 +17212,15 @@ class GatewayRunner:
                 except Exception as _sc_err:
                     logger.debug("Could not set up stream consumer: %s", _sc_err)
 
+            if pipeline and not pipeline_final_only:
+                orig_delta_cb = _stream_delta_cb
+                def _voice_stream_delta_cb(text: str) -> None:
+                    if _run_still_current():
+                        if orig_delta_cb:
+                            orig_delta_cb(text)
+                        pipeline.feed(text)
+                _stream_delta_cb = _voice_stream_delta_cb
+
             def _interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
                 if not _run_still_current():
                     return
@@ -16642,10 +17275,18 @@ class GatewayRunner:
 
             if agent is None:
                 # Config changed or first message — create fresh agent
+                agent_kwargs = {}
+                fallback_model = self._fallback_model
+                if low_latency_voice:
+                    agent_kwargs["max_tokens"] = _discord_voice_max_tokens()
+                    voice_fallbacks = _discord_voice_fallback_models()
+                    if voice_fallbacks:
+                        fallback_model = voice_fallbacks
                 agent = AIAgent(
                     model=turn_route["model"],
                     **turn_route["runtime"],
                     max_iterations=max_iterations,
+                    **agent_kwargs,
                     quiet_mode=True,
                     verbose_logging=False,
                     enabled_toolsets=enabled_toolsets,
@@ -16671,13 +17312,25 @@ class GatewayRunner:
                     thread_id=source.thread_id,
                     gateway_session_key=session_key,
                     session_db=self._session_db,
-                    fallback_model=self._fallback_model,
+                    fallback_model=fallback_model,
                 )
                 if _cache_lock and _cache is not None:
                     with _cache_lock:
                         _cache[session_key] = (agent, _sig)
                         self._enforce_agent_cache_cap()
                 logger.debug("Created new agent for session %s (sig=%s)", session_key, _sig)
+
+            if low_latency_voice:
+                setattr(agent, "low_latency_voice", True)
+                voice_fallbacks = _discord_voice_fallback_models()
+                if voice_fallbacks and not getattr(agent, "_fallback_chain", None):
+                    agent._fallback_chain = voice_fallbacks
+                    agent._fallback_index = 0
+                    agent._fallback_model = voice_fallbacks[0]
+                    logger.info(
+                        "Discord voice fallback chain configured: %s",
+                        " -> ".join(f.get("model", "") for f in voice_fallbacks),
+                    )
 
             # Per-message state — callbacks and reasoning config change every
             # turn and must not be baked into the cached agent constructor.
@@ -16689,6 +17342,8 @@ class GatewayRunner:
             agent.reasoning_config = reasoning_config
             agent.service_tier = self._service_tier
             agent.request_overrides = turn_route.get("request_overrides") or {}
+            if low_latency_voice:
+                setattr(agent, "max_tokens", _discord_voice_max_tokens())
 
             _bg_review_release = threading.Event()
             _bg_review_pending: list[str] = []
@@ -17298,7 +17953,6 @@ class GatewayRunner:
                 "context_length": _context_length,
                 "session_id": effective_session_id,
                 "response_previewed": result.get("response_previewed", False),
-                "response_transformed": result.get("response_transformed", False),
             }
         
         # Start progress message sender if enabled
@@ -17637,6 +18291,39 @@ class GatewayRunner:
                     # agent so the next message retries the primary model.
                     self._evict_cached_agent(session_key)
 
+            if pipeline:
+                if getattr(pipeline, "final_only", False) and result_holder[0] and not result_holder[0].get("failed"):
+                    final_voice_text = str(result_holder[0].get("final_response") or "").strip()
+                    if final_voice_text and not final_voice_text.startswith("Error:"):
+                        try:
+                            from gateway.voice_pipeline import is_voice_control_message, prepare_voice_response_text
+
+                            final_voice_text = "" if is_voice_control_message(final_voice_text) else prepare_voice_response_text(final_voice_text)
+                        except Exception as exc:
+                            logger.debug("Discord voice final-response guardrail skipped: %s", exc)
+                        if final_voice_text:
+                            logger.info("Discord voice pipeline final-only mode: queueing final response for TTS")
+                            pipeline.feed(final_voice_text)
+                pipeline.flush()
+                await pipeline.close()
+                if result_holder[0]:
+                    if pipeline.delivered_any:
+                        # Voice chunks have already been spoken in VC.  Keep normal
+                        # text streaming/final-send semantics separate from audio
+                        # de-duplication so final text is not accidentally
+                        # suppressed, and so _should_send_voice_reply can skip the
+                        # old full-response TTS path.
+                        result_holder[0]["voice_pipeline_audio_sent"] = True
+                    if pipeline.attempted_any:
+                        result_holder[0]["voice_pipeline_tts_attempted"] = True
+                    if pipeline.delivered_any or pipeline.attempted_any:
+                        # The base adapter's voice-input auto-TTS runs later when
+                        # it delivers the final text response.  Mark this event so
+                        # legacy full-response TTS does not re-synthesize the same
+                        # reply after the low-latency Discord VC pipeline has
+                        # already spoken or attempted phrase chunks.
+                        setattr(event, "suppress_auto_tts", True)
+
             # Check if we were interrupted OR have a queued message (/queue).
             result = result_holder[0]
             adapter = self.adapters.get(source.platform)
@@ -17936,11 +18623,7 @@ class GatewayRunner:
             _content_delivered = bool(
                 _sc and getattr(_sc, "final_content_delivered", False)
             )
-            # Plugin hooks (e.g. transform_llm_output) may have appended content
-            # after streaming finished — when the response was transformed, always
-            # send the final version so the appended content reaches the client.
-            _transformed = bool(response.get("response_transformed"))
-            if not _is_empty_sentinel and not _transformed and (_streamed or _previewed or _content_delivered):
+            if not _is_empty_sentinel and (_streamed or _previewed or _content_delivered):
                 logger.info(
                     "Suppressing normal final send for session %s: final delivery already confirmed (streamed=%s previewed=%s content_delivered=%s).",
                     session_key or "?",
@@ -17949,28 +18632,6 @@ class GatewayRunner:
                     _content_delivered,
                 )
                 response["already_sent"] = True
-            elif not _is_empty_sentinel and _transformed and _sc is not None:
-                # Plugin hooks transformed the response after streaming — edit the
-                # existing streamed message instead of sending a duplicate.
-                _sc_msg_id = _sc.message_id
-                if _sc_msg_id:
-                    try:
-                        await _sc.adapter.edit_message(
-                            chat_id=source.chat_id,
-                            message_id=_sc_msg_id,
-                            content=response["final_response"],
-                            finalize=True,
-                        )
-                        response["already_sent"] = True
-                        logger.info(
-                            "Edited streamed message %s for session %s to include plugin-transformed content.",
-                            _sc_msg_id, session_key or "?",
-                        )
-                    except Exception as _edit_err:
-                        logger.warning(
-                            "Failed to edit streamed message for session %s: %s",
-                            session_key or "?", _edit_err,
-                        )
 
         # Schedule deletion of tracked temporary progress bubbles after the
         # final response lands. Failed runs skip this so bubbles remain as
@@ -18397,21 +19058,6 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         runner.request_restart(detached=False, via_service=True)
     
     loop = asyncio.get_running_loop()
-
-    # Install a loop-level exception handler that swallows transient
-    # network errors from background tasks. Issues #31066 / #31110:
-    # an unhandled ``telegram.error.TimedOut`` (or peer NetworkError /
-    # httpx connection error) in any awaited coroutine would propagate
-    # to the loop and kill the gateway process, taking down every
-    # profile attached to the same runner. systemd then restarts the
-    # service after ~5s but the active conversation turn is lost.
-    #
-    # The fix is intentionally narrow: only well-known transient
-    # network errors are swallowed (and logged with full traceback so
-    # the originating call site is still discoverable). Anything else
-    # is forwarded to the default handler so real bugs still surface.
-    loop.set_exception_handler(_gateway_loop_exception_handler)
-
     if threading.current_thread() is threading.main_thread():
         for sig in (signal.SIGINT, signal.SIGTERM):
             try:

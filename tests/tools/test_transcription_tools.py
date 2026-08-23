@@ -1437,3 +1437,80 @@ class TestShellSafety:
         monkeypatch.delenv(LOCAL_STT_COMMAND_ENV, raising=False)
         use_shell = bool(os.getenv(LOCAL_STT_COMMAND_ENV, "").strip())
         assert use_shell is False
+
+
+# ============================================================================
+# Local STT model prewarm
+# ============================================================================
+class TestPrewarmLocalSttModel:
+    def test_returns_false_when_stt_disabled(self, monkeypatch):
+        from tools.transcription_tools import prewarm_local_stt_model
+
+        with patch("tools.transcription_tools.is_stt_enabled", return_value=False):
+            assert prewarm_local_stt_model() is False
+
+    def test_returns_false_when_provider_not_local(self, monkeypatch):
+        from tools.transcription_tools import prewarm_local_stt_model
+
+        with patch("tools.transcription_tools.is_stt_enabled", return_value=True), \
+             patch("tools.transcription_tools._get_provider", return_value="groq"):
+            assert prewarm_local_stt_model() is False
+
+    def test_returns_false_when_faster_whisper_unavailable(self, monkeypatch):
+        from tools.transcription_tools import prewarm_local_stt_model
+
+        with patch("tools.transcription_tools.is_stt_enabled", return_value=True), \
+             patch("tools.transcription_tools._get_provider", return_value="local"), \
+             patch("tools.transcription_tools._HAS_FASTER_WHISPER", False), \
+             patch("tools.transcription_tools._try_lazy_install_stt", return_value=False):
+            assert prewarm_local_stt_model() is False
+
+    def test_loads_model_into_cache_when_local_provider_ready(self, monkeypatch):
+        from tools.transcription_tools import prewarm_local_stt_model
+
+        fake_model = MagicMock()
+
+        with patch("tools.transcription_tools.is_stt_enabled", return_value=True), \
+             patch("tools.transcription_tools._get_provider", return_value="local"), \
+             patch("tools.transcription_tools._HAS_FASTER_WHISPER", True), \
+             patch("tools.transcription_tools._load_local_whisper_model", return_value=fake_model) as mock_load, \
+             patch("tools.transcription_tools._local_model", None), \
+             patch("tools.transcription_tools._local_model_name", None):
+            assert prewarm_local_stt_model() is True
+            mock_load.assert_called_once_with("base")
+
+    def test_skips_reload_when_same_model_already_cached(self, monkeypatch):
+        from tools.transcription_tools import prewarm_local_stt_model
+
+        fake_model = MagicMock()
+
+        with patch("tools.transcription_tools.is_stt_enabled", return_value=True), \
+             patch("tools.transcription_tools._get_provider", return_value="local"), \
+             patch("tools.transcription_tools._HAS_FASTER_WHISPER", True), \
+             patch("tools.transcription_tools._load_local_whisper_model") as mock_load, \
+             patch("tools.transcription_tools._local_model", fake_model), \
+             patch("tools.transcription_tools._local_model_name", "base"):
+            assert prewarm_local_stt_model() is True
+            mock_load.assert_not_called()
+
+    def test_respects_config_model_override(self, monkeypatch):
+        from tools.transcription_tools import prewarm_local_stt_model
+
+        fake_model = MagicMock()
+
+        with patch("tools.transcription_tools.is_stt_enabled", return_value=True), \
+             patch("tools.transcription_tools._get_provider", return_value="local"), \
+             patch("tools.transcription_tools._HAS_FASTER_WHISPER", True), \
+             patch("tools.transcription_tools._load_local_whisper_model", return_value=fake_model) as mock_load, \
+             patch("tools.transcription_tools._local_model", None), \
+             patch("tools.transcription_tools._local_model_name", None), \
+             patch("tools.transcription_tools._load_stt_config", return_value={"local": {"model": "small"}}):
+            assert prewarm_local_stt_model() is True
+            mock_load.assert_called_once_with("small")
+
+    def test_prewarm_local_stt_alias_calls_model_helper(self):
+        from tools.transcription_tools import prewarm_local_stt
+
+        with patch("tools.transcription_tools.prewarm_local_stt_model", return_value=True) as mock_model:
+            assert prewarm_local_stt() is True
+            mock_model.assert_called_once_with()

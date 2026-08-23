@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 from types import SimpleNamespace, ModuleType
@@ -186,6 +187,36 @@ async def test_next_message_answers_via_plugin_api_and_skips_opencode_job(monkey
     assert channel.send.await_count == 2
     assert channel.send.await_args_list[0].args[0].startswith("Got it")
     assert channel.send.await_args_list[1].args[0] == "Answer: sleep supports memory consolidation."
+
+
+@pytest.mark.asyncio
+async def test_next_message_long_answer_is_split_to_discord_chunks(monkeypatch):
+    adapter = _adapter()
+    adapter._set_secondbrain_pending(
+        user_id="42",
+        channel_id="123",
+        corpus_key="science",
+        label="Science claims",
+    )
+    answer_api = _fake_secondbrain_plugin(monkeypatch, ["x" * 5000])
+
+    channel = SimpleNamespace(id=123, send=AsyncMock())
+    message = SimpleNamespace(
+        content="long question",
+        channel=channel,
+        author=SimpleNamespace(id=42, display_name="Tester", bot=False),
+        id=777,
+    )
+
+    handled = await adapter._maybe_handle_secondbrain_pending_question(message, "long question")
+
+    assert handled is True
+    assert answer_api.await_count == 1
+    sent_chunks = [call.args[0] for call in channel.send.await_args_list]
+    assert sent_chunks[0].startswith("Got it")
+    assert len(sent_chunks) >= 3
+    assert all(len(chunk) <= 2000 for chunk in sent_chunks[1:])
+    assert any(re.search(r"\(1/", chunk) for chunk in sent_chunks[1:])
 
 
 @pytest.mark.asyncio

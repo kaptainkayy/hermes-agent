@@ -3062,6 +3062,12 @@ class DiscordAdapter(BasePlatformAdapter):
         for chunk in chunks:
             await thread.send(chunk)
 
+    async def _send_text_to_channel(self, channel: Any, content: str) -> None:
+        formatted = self.format_message(content or "")
+        chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+        for chunk in chunks:
+            await channel.send(chunk)
+
     def _secondbrain_context_key(self, user_id: str, channel_id: str) -> tuple[str, str]:
         return (str(user_id), str(channel_id))
 
@@ -3196,7 +3202,7 @@ class DiscordAdapter(BasePlatformAdapter):
 
         if not answer:
             answer = "I couldn’t produce a Second Brain answer. Please try again in a moment."
-        await channel.send(answer)
+        await self._send_text_to_channel(channel, answer)
         return True
 
     def _load_secondbrain_index_for_discord(self):

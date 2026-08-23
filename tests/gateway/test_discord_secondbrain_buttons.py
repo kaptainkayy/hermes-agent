@@ -97,6 +97,16 @@ async def test_picking_a_corpus_offers_actions_for_it(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_picking_ai_science_offers_actions_for_it(monkeypatch):
+    adapter = _adapter()
+
+    action_view = await _pick_corpus(adapter, monkeypatch, key="ai_science")
+
+    assert isinstance(action_view, SecondBrainActionView)
+    assert _labels(action_view) == ["Ask", "Recent entries", "Change database"]
+
+
+@pytest.mark.asyncio
 async def test_ask_opens_a_box_to_type_the_question_in(monkeypatch):
     """Asking used to mean sending a channel message, which is public and easy to forget."""
     adapter = _adapter()
@@ -114,11 +124,12 @@ async def test_ask_opens_a_box_to_type_the_question_in(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_submitting_a_question_answers_from_the_picked_corpus(monkeypatch):
+@pytest.mark.parametrize("key,expected", [("science", "science"), ("ai_science", "ai_science")])
+async def test_submitting_a_question_answers_from_the_picked_corpus(monkeypatch, key, expected):
     adapter = _adapter()
     answer_api = _fake_answer_plugin(monkeypatch, ["Your notes say X [public.notes:n1]"])
 
-    action_view = await _pick_corpus(adapter, monkeypatch)
+    action_view = await _pick_corpus(adapter, monkeypatch, key=key)
     press = _interaction()
     press.response.send_modal = AsyncMock()
     await button(action_view, "Ask").callback(press)
@@ -130,7 +141,7 @@ async def test_submitting_a_question_answers_from_the_picked_corpus(monkeypatch)
     await modal.on_submit(submit)
 
     assert answer_api.await_args.args[1] == "what did I learn about sleep?"
-    assert answer_api.await_args.args[2] == "science", "must stay scoped to the picked corpus"
+    assert answer_api.await_args.args[2] == expected, "must stay scoped to the picked corpus"
     # Retrieval plus generation runs tens of seconds, so the interaction must be deferred.
     submit.response.defer.assert_awaited_once()
     assert "Your notes say X" in submit.followup.send.await_args.args[0]
@@ -235,18 +246,22 @@ async def test_picking_a_corpus_still_arms_the_typed_question(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_recent_entries_browses_the_corpus_that_was_picked(monkeypatch):
+@pytest.mark.parametrize("key,expected", [("science", "science"), ("ai_science", "ai_science")])
+async def test_recent_entries_browses_the_corpus_that_was_picked(monkeypatch, key, expected):
     adapter = _adapter()
-    browse = _fake_browse_plugin(monkeypatch, ["Most recent entries in science.claims:\n- science.claims:c1 - Sleep"])
+    browse = _fake_browse_plugin(
+        monkeypatch,
+        [f"Most recent entries in {expected}:\n- {expected}:c1 - Sleep"],
+    )
 
-    action_view = await _pick_corpus(adapter, monkeypatch)
+    action_view = await _pick_corpus(adapter, monkeypatch, key=key)
     press = _interaction()
     press.edit_original_response = AsyncMock()
     await button(action_view, "Recent entries").callback(press)
 
-    assert browse.await_args.args[0] == "science", "must browse the picked corpus, not everything"
+    assert browse.await_args.args[0] == expected, "must browse the picked corpus, not everything"
     shown = press.edit_original_response.await_args.kwargs["content"]
-    assert "science.claims:c1" in shown
+    assert f"{expected}:c1" in shown
 
 
 @pytest.mark.asyncio

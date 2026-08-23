@@ -67,7 +67,11 @@ def _fake_secondbrain_plugin(monkeypatch, answers):
 
 class FakeIndex:
     def enabled_entries(self):
-        return [_entry(), _entry("robert_moore", "Robert Moore transcripts")]
+        return [
+            _entry(),
+            _entry("ai_science", "AI research papers"),
+            _entry("robert_moore", "Robert Moore transcripts"),
+        ]
 
     def get_entry(self, key):
         for entry in self.enabled_entries():
@@ -92,6 +96,18 @@ async def test_secondbrain_slash_sends_ephemeral_select(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_secondbrain_picker_includes_ai_science(monkeypatch):
+    adapter = _adapter()
+    monkeypatch.setattr(adapter, "_load_secondbrain_index_for_discord", lambda: FakeIndex(), raising=False)
+    interaction = _interaction()
+
+    await adapter._handle_secondbrain_picker_slash(interaction)
+
+    options = interaction.response.send_message.await_args.kwargs["view"].children[0].options
+    assert any(option.label == "AI research papers" for option in options)
+
+
+@pytest.mark.asyncio
 async def test_select_stores_pending_selection(monkeypatch):
     adapter = _adapter()
     view = SecondBrainCorpusSelectView(adapter=adapter, index=FakeIndex(), allowed_user_ids={"42"}, allowed_role_ids=set())
@@ -103,6 +119,21 @@ async def test_select_stores_pending_selection(monkeypatch):
     pending = adapter._secondbrain_pending[("42", "123")]
     assert pending["corpus_key"] == "science"
     assert pending["label"] == "Science claims"
+    interaction.response.edit_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_select_stores_ai_science_selection(monkeypatch):
+    adapter = _adapter()
+    view = SecondBrainCorpusSelectView(adapter=adapter, index=FakeIndex(), allowed_user_ids={"42"}, allowed_role_ids=set())
+    interaction = _interaction()
+    interaction.data = {"values": ["ai_science"]}
+
+    await view._on_corpus_selected(interaction)
+
+    pending = adapter._secondbrain_pending[("42", "123")]
+    assert pending["corpus_key"] == "ai_science"
+    assert pending["label"] == "AI research papers"
     interaction.response.edit_message.assert_awaited_once()
 
 
@@ -121,13 +152,20 @@ async def test_unauthorized_select_is_rejected():
 
 
 @pytest.mark.asyncio
-async def test_next_message_answers_via_plugin_api_and_skips_opencode_job(monkeypatch):
+@pytest.mark.parametrize(
+    "corpus_key,label,expected_key",
+    [
+        ("science", "Science claims", "science"),
+        ("ai_science", "AI research papers", "ai_science"),
+    ],
+)
+async def test_next_message_answers_via_plugin_api_and_skips_opencode_job(monkeypatch, corpus_key, label, expected_key):
     adapter = _adapter()
     adapter._set_secondbrain_pending(
         user_id="42",
         channel_id="123",
-        corpus_key="science",
-        label="Science claims",
+        corpus_key=corpus_key,
+        label=label,
     )
     answer_api = _fake_secondbrain_plugin(monkeypatch, ["Answer: sleep supports memory consolidation."])
 
@@ -144,7 +182,7 @@ async def test_next_message_answers_via_plugin_api_and_skips_opencode_job(monkey
     assert handled is True
     assert answer_api.await_count == 1
     assert answer_api.await_args.args[1] == "what claims mention sleep?"
-    assert answer_api.await_args.args[2] == "science"
+    assert answer_api.await_args.args[2] == expected_key
     assert channel.send.await_count == 2
     assert channel.send.await_args_list[0].args[0].startswith("Got it")
     assert channel.send.await_args_list[1].args[0] == "Answer: sleep supports memory consolidation."
